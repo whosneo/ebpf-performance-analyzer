@@ -279,5 +279,5 @@ diff memory_before.log memory_after.log
 
 如果您有任何问题或建议，请通过以下方式联系我们：
 
-- GitHub Issues: [提交问题](https://github.com/yourusername/ebpf-performance-analyzer/issues)
-- 邮件: your.email@example.com 
+- GitHub Issues: [提交问题](https://github.com/whosneo/ebpf-performance-analyzer/issues)
+- 邮件: whosneo@qq.com 

@@ -42,7 +42,7 @@ sudo yum install -y bcc-tools kernel-devel python3-bcc
 ### 克隆仓库
 
 ```bash
-git clone https://github.com/yourusername/ebpf-performance-analyzer.git
+git clone https://github.com/whosneo/ebpf-performance-analyzer.git
 cd ebpf-performance-analyzer
 ```
 
