@@ -87,6 +87,8 @@
 5. 编写一个安全威胁检测系统
 6. 设计一个网络数据包过滤器
 7. 实现一个自定义的负载均衡器
+8. 开发一个锁争用分析器
+9. 构建一个内存泄漏检测工具
 
 ## eBPF工具生态系统
 
@@ -98,6 +100,8 @@ eBPF工具可以分为以下几类：
 - **CPU分析**: `cpudist`, `hardirqs`, `softirqs`
 - **安全监控**: `opensnoop`, `execsnoop`, `modinfo`
 - **内存分析**: `memleak`, `cachestat`, `mmapsnoop`
+- **锁分析**: `lockstat`, `lockdist`, `locktime`
+- **内存泄漏检测**: `memleak`, `memalloc`, `memstat`
 
 ## eBPF的未来发展
 

@@ -24,12 +24,14 @@ sudo yum install -y bcc-tools kernel-devel python3-bcc
 
 ## 工具概览
 
-本工具集包含四个主要的性能分析工具：
+本工具集包含六个主要的性能分析工具：
 
 1. **CPU性能分析器** (`cpu_profiler.py`) - 分析CPU使用情况和热点函数
 2. **内存分析器** (`memory_analyzer.py`) - 跟踪内存分配和潜在的内存泄漏
 3. **I/O性能分析器** (`io_analyzer.py`) - 监控磁盘I/O操作和延迟
 4. **网络性能分析器** (`network_profiler.py`) - 分析网络连接和数据传输
+5. **锁分析器** (`lock_analyzer.py`) - 监控和分析系统中的锁争用情况
+6. **内存泄漏检测器** (`memory_leak_detector.py`) - 跟踪内存分配和释放，识别未释放的内存分配
 
 ## 使用方法
 
@@ -181,6 +183,116 @@ PID     进程名           接收(MB)       发送(MB)       总流量(MB)     
 ...
 ```
 
+### 5. 锁分析
+
+锁分析器用于监控和分析系统中的锁争用情况，帮助识别性能瓶颈。
+
+```bash
+# 监控特定PID的锁争用情况
+sudo python3 tools/lock_analyzer.py [PID]
+
+# 设置争用阈值（锁等待时间超过0.5ms才记录）
+sudo python3 tools/lock_analyzer.py [PID] -t 0.5
+
+# 只监控某种类型的锁（如互斥锁）
+sudo python3 tools/lock_analyzer.py [PID] -l mutex
+
+# 监控30秒并显示前10个高争用锁
+sudo python3 tools/lock_analyzer.py [PID] -d 30 -c 10
+```
+
+输出示例：
+```
+开始监控PID 1234 的锁争用情况...
+监控持续时间: 10秒
+开始时间: 2023-06-01 10:30:00
+
+== 开始实时锁争用监控 ==
+[10:30:01.234567] Thread 1235 等待互斥锁 0x7f8a1c2b3d40，持有者: Thread 1236, 等待时间: 2.35ms
+[10:30:02.345678] Thread 1237 等待自旋锁 0x7f8a1c2b3e80，持有者: Thread 1238, 等待时间: 0.78ms
+...
+
+结束时间: 2023-06-01 10:30:10
+总监控时间: 10.00秒
+
+===== 锁争用统计 =====
+锁地址          类型       争用次数    总等待时间(ms)   平均等待时间(ms)   最大等待时间(ms)   持有线程
+---------------------------------------------------------------------------------------------
+0x7f8a1c2b3d40  mutex         27           63.5              2.35              7.82          1236
+0x7f8a1c2b3e80  spinlock      14           10.9              0.78              1.25          1238
+...
+
+===== 热点争用堆栈 =====
+#1 互斥锁 0x7f8a1c2b3d40 (27次争用)
+获取锁堆栈:
+    pthread_mutex_lock+0x1e7 [0x7f8a1c1b0b67]
+    database_transaction+0x45 [0x555555556c45]
+    process_request+0x67 [0x555555556367]
+...
+```
+
+### 6. 内存泄漏检测
+
+内存泄漏检测器专门用于跟踪内存分配和释放，识别潜在的内存泄漏。
+
+```bash
+# 监控特定PID的内存泄漏情况
+sudo python3 tools/memory_leak_detector.py [PID]
+
+# 设置报告间隔（每60秒生成一次报告）
+sudo python3 tools/memory_leak_detector.py [PID] -t 60
+
+# 只显示大于1KB的泄漏
+sudo python3 tools/memory_leak_detector.py [PID] -s 1024
+
+# 同时监控内核空间内存泄漏
+sudo python3 tools/memory_leak_detector.py [PID] -k
+```
+
+输出示例：
+```
+开始监控PID 1234 的内存泄漏情况...
+监控持续时间: 10分钟
+开始时间: 2023-06-01 10:30:00
+
+== 生成内存泄漏报告（10:31:00）==
+检测到可能的内存泄漏：
+1. 5.2MB 未释放（42次分配）
+   堆栈:
+   load_config+0x123 [0x555555555123]
+   parse_json+0x45 [0x555555555245]
+   main+0x67 [0x555555555067]
+
+2. 1.8MB 未释放（15次分配）
+   堆栈:
+   create_buffer+0x87 [0x555555555387]
+   process_image+0xab [0x5555555553ab]
+   handle_request+0xcd [0x5555555553cd]
+...
+
+== 生成内存泄漏报告（10:32:00）==
+检测到可能的内存泄漏：
+1. 10.5MB 未释放（84次分配，+42次）
+   堆栈:
+   load_config+0x123 [0x555555555123]
+   parse_json+0x45 [0x555555555245]
+   main+0x67 [0x555555555067]
+...
+
+结束时间: 2023-06-01 10:40:00
+总监控时间: 10.00分钟
+
+===== 内存泄漏摘要 =====
+总检测到的可能泄漏: 3
+总泄漏内存: 15.7MB
+最大单一泄漏: 10.5MB (load_config函数)
+
+===== 建议修复位置 =====
+1. load_config函数 (源文件: src/config.c:123)
+2. create_buffer函数 (源文件: src/image.c:87)
+3. init_cache函数 (源文件: src/cache.c:45)
+```
+
 ## 性能问题排查流程
 
 下面是一个使用这些工具进行性能问题排查的建议流程：
@@ -191,7 +303,7 @@ PID     进程名           接收(MB)       发送(MB)       总流量(MB)     
 
 2. **内存问题诊断**：
    - 如果怀疑有内存泄漏或内存使用过高的问题
-   - 运行 `memory_analyzer.py --leaks` 针对特定进程进行分析
+   - 运行 `memory_analyzer.py --leaks` 或更专门的 `memory_leak_detector.py` 进行分析
 
 3. **I/O性能分析**：
    - 如果系统响应缓慢，可能存在I/O瓶颈
@@ -201,7 +313,11 @@ PID     进程名           接收(MB)       发送(MB)       总流量(MB)     
    - 对于网络应用，分析网络延迟和吞吐量
    - 运行 `network_profiler.py --verbose` 查看详细的网络连接和数据传输
 
-5. **持续监控**：
+5. **锁争用分析**：
+   - 如果多线程应用程序响应缓慢或CPU使用率不足
+   - 运行 `lock_analyzer.py` 识别可能的锁争用瓶颈
+
+6. **持续监控**：
    - 使用较长的监控时间（如 `-d 3600` 监控一小时）
    - 将输出重定向到文件以便后续分析：`sudo python3 tools/cpu_profiler.py > cpu_profile.log`
 
@@ -229,14 +345,20 @@ PID     进程名           接收(MB)       发送(MB)       总流量(MB)     
   - 使用连接池和长连接
   - 考虑压缩数据或优化协议
 
+- **锁争用问题**：
+  - 减小锁的粒度，分解全局锁
+  - 使用读写锁代替互斥锁（适用于读多写少的场景）
+  - 考虑无锁数据结构或原子操作
+  - 减少临界区代码执行时间
+
 ## 高级用法
 
 这些工具支持多种高级用法，您可以通过组合不同的参数来满足特定需求：
 
 ```bash
-# 同时监控CPU和I/O
+# 同时监控CPU和锁争用
 sudo python3 tools/cpu_profiler.py [PID] > cpu.log &
-sudo python3 tools/io_analyzer.py [PID] > io.log &
+sudo python3 tools/lock_analyzer.py [PID] > lock.log &
 
 # 创建系统性能基准测试
 for i in {1..5}; do
@@ -245,10 +367,10 @@ for i in {1..5}; do
 done
 
 # 比较优化前后的性能
-sudo python3 tools/memory_analyzer.py [PID] -d 60 > memory_before.log
+sudo python3 tools/lock_analyzer.py [PID] -d 60 > locks_before.log
 # 应用优化措施
-sudo python3 tools/memory_analyzer.py [PID] -d 60 > memory_after.log
-diff memory_before.log memory_after.log
+sudo python3 tools/lock_analyzer.py [PID] -d 60 > locks_after.log
+diff locks_before.log locks_after.log
 ```
 
 ## 附加资源

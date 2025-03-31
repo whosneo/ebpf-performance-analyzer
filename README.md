@@ -18,6 +18,8 @@ ebpf-performance-analyzer/
 - I/O性能分析：监控磁盘I/O操作
 - 网络性能分析：监控网络连接和吞吐量
 - 系统调用跟踪：分析系统调用模式和频率
+- 锁分析：监控和分析系统中的锁争用情况
+- 内存泄漏检测：识别未释放的内存分配和潜在的内存泄漏
 
 ## 环境要求
 
@@ -70,6 +72,18 @@ sudo python3 tools/io_analyzer.py [PID]
 
 ```bash
 sudo python3 tools/network_profiler.py [interface]
+```
+
+### 锁分析
+
+```bash
+sudo python3 tools/lock_analyzer.py [PID]
+```
+
+### 内存泄漏检测
+
+```bash
+sudo python3 tools/memory_leak_detector.py [PID]
 ```
 
 ## 学习资源
