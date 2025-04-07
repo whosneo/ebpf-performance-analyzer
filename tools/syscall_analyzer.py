@@ -11,6 +11,12 @@ import argparse
 from bcc import BPF
 from datetime import datetime
 import ctypes as ct
+import os
+import logging
+
+# 导入公共模块
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from src.ebpf_common import setup_logging, validate_args, setup_signal_handler
 
 # 支持的最大系统调用号
 MAX_SYSCALL_ID = 450  # 大多数系统的系统调用号不会超过这个值
@@ -198,6 +204,8 @@ def parse_args():
         help="要监控的进程ID (0表示所有进程)")
     parser.add_argument("-d", "--duration", type=int, default=10,
         help="监控持续时间(秒)")
+    parser.add_argument("-i", "--interval", type=int, default=5,
+        help="报告间隔(秒)")
     parser.add_argument("-t", "--threshold", type=float, default=1.0,
         help="系统调用延迟阈值(毫秒)，只输出高于此阈值的调用")
     parser.add_argument("-s", "--syscall", type=int, default=0,
@@ -208,7 +216,24 @@ def parse_args():
         help="采样频率，每秒最多输出的事件数")
     parser.add_argument("-p", "--profile", action="store_true",
         help="生成系统调用性能分析报告")
+    parser.add_argument("-v", "--verbose", action="store_true",
+        help="启用详细日志输出")
     return parser.parse_args()
+
+def validate_syscall_args(args):
+    """验证系统调用分析器参数"""
+    if args.duration <= 0:
+        logging.error("监控时长必须大于0")
+        return False
+    if args.threshold < 0:
+        logging.error("延迟阈值必须大于或等于0")
+        return False
+    if args.frequency < 0:
+        logging.error("采样频率必须大于或等于0")
+        return False
+    if args.syscall < 0 or args.syscall > MAX_SYSCALL_ID:
+        logging.warning(f"系统调用ID {args.syscall} 可能超出有效范围")
+    return True
 
 # 系统调用名称映射
 def get_syscall_names():
@@ -229,7 +254,7 @@ def get_syscall_names():
                             except ValueError:
                                 pass
     except Exception as e:
-        print(f"警告: 无法加载系统调用名称: {e}")
+        logging.warning(f"无法加载系统调用名称: {e}")
     
     # 确保我们至少有一些常见的系统调用
     if not syscall_names:
@@ -265,89 +290,24 @@ def get_syscall_names():
     return syscall_names
 
 def print_event(cpu, data, size, syscall_names, args):
-    event = ct.cast(data, ct.POINTER(SyscallEvent)).contents
-    syscall_name = syscall_names.get(event.syscall_id, f"syscall_{event.syscall_id}")
-    duration_ms = event.duration_ns / 1000000
-    
-    # 格式化输出
-    timestamp = datetime.fromtimestamp(event.ts / 1000000000).strftime('%H:%M:%S.%f')
-    status = "成功" if event.ret >= 0 else f"错误 ({event.ret})"
-    print(f"[{timestamp}] PID: {event.pid} ({event.comm.decode('utf-8', 'replace')}), "
-          f"系统调用: {syscall_name} (ID: {event.syscall_id}), "
-          f"耗时: {duration_ms:.3f}ms, 返回值: {event.ret}, 状态: {status}")
-
-def main():
-    args = parse_args()
-    
-    threshold_ns = int(args.threshold * 1000000)  # 转换为纳秒
-    print(f"开始监控{'PID ' + str(args.pid) if args.pid else '所有进程'} 的系统调用...")
-    print(f"监控持续时间: {args.duration}秒")
-    print(f"延迟阈值: {args.threshold}ms")
-    
-    if args.syscall:
-        print(f"只监控系统调用ID: {args.syscall}")
-    
-    if args.all:
-        print("输出所有系统调用，不管延迟")
-    
-    # 加载系统调用名称
-    syscall_names = get_syscall_names()
-    
-    # 替换eBPF程序中的变量
-    bpf_program = bpf_text.replace('PID_FILTER', str(args.pid))
-    bpf_program = bpf_program.replace('SYSCALL_FILTER', str(args.syscall))
-    bpf_program = bpf_program.replace('THRESHOLD_NS', str(threshold_ns))
-    bpf_program = bpf_program.replace('LOG_ALL', "1" if args.all else "0")
-    
-    # 加载eBPF程序
-    b = BPF(text=bpf_program)
-    
-    # 监控指定的时间
-    start_time = datetime.now()
-    print(f"开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # 定义事件回调
-    event_count = 0
-    start_ts = time.time()
-    
-    def event_callback(cpu, data, size):
-        nonlocal event_count, start_ts
-        
-        # 频率限制
-        if args.frequency > 0:
-            current_ts = time.time()
-            time_diff = current_ts - start_ts
-            if time_diff > 0:
-                rate = event_count / time_diff
-                if rate > args.frequency:
-                    event_count += 1
-                    return
-            
-            event_count += 1
-            if time_diff > 1:  # 每秒重置计数器
-                event_count = 0
-                start_ts = current_ts
-        
-        # 输出事件
-        print_event(cpu, data, size, syscall_names, args)
-    
-    # 注册事件回调
-    b["events"].open_perf_buffer(event_callback)
-    
     try:
-        # 监控loop
-        while datetime.now() - start_time < datetime.timedelta(seconds=args.duration):
-            b.perf_buffer_poll(timeout=100)
-    except KeyboardInterrupt:
-        print("监控被用户中断")
-    
-    end_time = datetime.now()
-    print(f"结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"总监控时间: {(end_time - start_time).total_seconds():.2f}秒")
-    
-    # 生成性能分析报告
-    if args.profile:
-        print("\n----- 系统调用性能分析报告 -----")
+        event = ct.cast(data, ct.POINTER(SyscallEvent)).contents
+        syscall_name = syscall_names.get(event.syscall_id, f"syscall_{event.syscall_id}")
+        duration_ms = event.duration_ns / 1000000
+        
+        # 格式化输出
+        timestamp = datetime.fromtimestamp(event.ts / 1000000000).strftime('%H:%M:%S.%f')
+        status = "成功" if event.ret >= 0 else f"错误 ({event.ret})"
+        logging.info(f"[{timestamp}] PID: {event.pid} ({event.comm.decode('utf-8', 'replace')}), "
+              f"系统调用: {syscall_name} (ID: {event.syscall_id}), "
+              f"耗时: {duration_ms:.3f}ms, 返回值: {event.ret}, 状态: {status}")
+    except Exception as e:
+        logging.error(f"处理系统调用事件时出错: {str(e)}")
+
+def generate_syscall_profile_report(b, syscall_names, args):
+    """生成系统调用性能分析报告"""
+    try:
+        logging.info("\n----- 系统调用性能分析报告 -----")
         
         # 从内核中收集统计信息
         syscall_stats = b.get_table("syscall_stats")
@@ -381,7 +341,7 @@ def main():
         sorted_stats = sorted(stats_list, key=lambda x: x[3], reverse=True)
         
         # 输出表头
-        print("%-6s %-20s %-12s %-12s %-12s %-12s %-12s %-10s" % (
+        logging.info("%-6s %-20s %-12s %-12s %-12s %-12s %-12s %-10s" % (
             "PID", "系统调用", "次数", "总时间(ms)", "平均(ms)", "最小(ms)", "最大(ms)", "错误次数"
         ))
         
@@ -389,7 +349,7 @@ def main():
         for stat in sorted_stats:
             pid, syscall_id, syscall_name, count, total_ns, avg_ns, min_ns, max_ns, errors = stat
             
-            print("%-6d %-20s %-12d %-12.2f %-12.2f %-12.2f %-12.2f %-10d" % (
+            logging.info("%-6d %-20s %-12d %-12.2f %-12.2f %-12.2f %-12.2f %-10d" % (
                 pid, syscall_name, count, 
                 total_ns / 1000000, avg_ns / 1000000, 
                 min_ns / 1000000, max_ns / 1000000, 
@@ -401,12 +361,132 @@ def main():
         total_time = sum(x[4] for x in stats_list) / 1000000
         total_errors = sum(x[8] for x in stats_list)
         
-        print("-" * 96)
-        print(f"总计: {len(stats_list)} 种系统调用, {total_calls} 次调用, "
+        logging.info("-" * 96)
+        logging.info(f"总计: {len(stats_list)} 种系统调用, {total_calls} 次调用, "
               f"总时间: {total_time:.2f}ms, 错误: {total_errors} 次")
+              
+        return stats_list
+    except Exception as e:
+        logging.error(f"生成系统调用分析报告时出错: {str(e)}")
+        return None
+
+def main():
+    args = parse_args()
     
-    # 清理资源
-    b.cleanup()
+    # 设置日志
+    setup_logging(args.verbose)
+    
+    # 参数校验
+    if not validate_syscall_args(args):
+        return 1
+    
+    threshold_ns = int(args.threshold * 1000000)  # 转换为纳秒
+    logging.info(f"开始监控{'PID ' + str(args.pid) if args.pid else '所有进程'} 的系统调用...")
+    logging.info(f"监控持续时间: {args.duration}秒")
+    logging.info(f"报告间隔: {args.interval}秒")
+    logging.info(f"延迟阈值: {args.threshold}ms")
+    
+    if args.syscall:
+        logging.info(f"只监控系统调用ID: {args.syscall}")
+    
+    if args.all:
+        logging.info("输出所有系统调用，不管延迟")
+    
+    try:
+        # 加载系统调用名称
+        syscall_names = get_syscall_names()
+        
+        # 替换eBPF程序中的变量
+        bpf_program = bpf_text.replace('PID_FILTER', str(args.pid))
+        bpf_program = bpf_program.replace('SYSCALL_FILTER', str(args.syscall))
+        bpf_program = bpf_program.replace('THRESHOLD_NS', str(threshold_ns))
+        bpf_program = bpf_program.replace('LOG_ALL', "1" if args.all else "0")
+        
+        # 加载eBPF程序
+        b = BPF(text=bpf_program)
+        
+        # 定义用于清理资源的函数
+        def cleanup():
+            if 'b' in locals():
+                b.cleanup()
+        
+        # 设置信号处理器
+        setup_signal_handler(cleanup)
+        
+        # 监控指定的时间
+        start_time = datetime.now()
+        logging.info(f"开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # 定义事件回调
+        event_count = 0
+        start_ts = time.time()
+        
+        def event_callback(cpu, data, size):
+            try:
+                nonlocal event_count, start_ts
+                
+                # 频率限制
+                if args.frequency > 0:
+                    current_ts = time.time()
+                    time_diff = current_ts - start_ts
+                    if time_diff > 0:
+                        rate = event_count / time_diff
+                        if rate > args.frequency:
+                            event_count += 1
+                            return
+                    
+                    event_count += 1
+                    if time_diff > 1:  # 每秒重置计数器
+                        event_count = 0
+                        start_ts = current_ts
+                
+                # 输出事件
+                print_event(cpu, data, size, syscall_names, args)
+            except Exception as e:
+                logging.error(f"处理事件回调时出错: {str(e)}")
+        
+        # 注册事件回调
+        b["events"].open_perf_buffer(event_callback)
+        
+        # 定义定期报告函数
+        next_report = time.time() + args.interval
+        
+        def periodic_report():
+            nonlocal next_report
+            if args.profile and time.time() >= next_report:
+                elapsed = (datetime.now() - start_time).total_seconds()
+                logging.info(f"\n===== 中间报告 ({elapsed:.1f}秒) =====")
+                generate_syscall_profile_report(b, syscall_names, args)
+                next_report = time.time() + args.interval
+        
+        try:
+            # 监控loop
+            while (datetime.now() - start_time).total_seconds() < args.duration:
+                b.perf_buffer_poll(timeout=100)
+                periodic_report()
+        except KeyboardInterrupt:
+            logging.warning("监控被用户中断")
+        
+        end_time = datetime.now()
+        logging.info(f"结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        elapsed = (end_time - start_time).total_seconds()
+        logging.info(f"总监控时间: {elapsed:.2f}秒")
+        
+        # 生成性能分析报告
+        if args.profile:
+            logging.info("\n===== 最终系统调用性能分析报告 =====")
+            generate_syscall_profile_report(b, syscall_names, args)
+        
+    except Exception as e:
+        logging.exception(f"执行过程中发生错误: {str(e)}")
+        return 1
+    finally:
+        # 清理资源
+        if 'b' in locals():
+            b.cleanup()
+    
+    return 0
 
 if __name__ == "__main__":
-    main() 
+    exit_code = main()
+    sys.exit(exit_code) 

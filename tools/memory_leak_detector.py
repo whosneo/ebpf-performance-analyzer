@@ -14,6 +14,7 @@ from time import sleep, strftime
 import ctypes as ct
 from collections import defaultdict, namedtuple
 from datetime import datetime
+import logging
 
 # eBPF程序
 bpf_text = """
@@ -580,6 +581,13 @@ def parse_args():
 
 def main():
     args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    if args.duration <= 0:
+        logging.error("监控时长必须大于0")
+        sys.exit(1)
+    if args.interval <= 0:
+        logging.error("报告间隔必须大于0")
+        sys.exit(1)
     
     # 默认同时跟踪用户和内核空间
     if not args.kernel and not args.user:
@@ -624,8 +632,8 @@ def main():
     
     # 处理用户中断
     def signal_handler(sig, frame):
-        print("\n监控被用户中断")
-        generate_report(True)
+        logging.warning("监控被用户中断")
+        generate_report(final=True)
         sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)
@@ -661,15 +669,15 @@ def main():
             
             if args.show_all:
                 ts = datetime.fromtimestamp(timestamp / 1000000000).strftime('%H:%M:%S.%f')
-                print(f"[{ts}] 分配: PID {pid} ({comm}) 地址:0x{addr:x} 大小:{human_size(event_size)}")
+                logging.info("[{}] 分配: PID {} ({}) 地址:0x{:x} 大小:{}".format(ts, pid, comm, addr, human_size(event_size)))
                 
                 # 打印堆栈跟踪
                 if stack_id >= 0:
                     stack = get_stack_trace(b, stack_id, pid)
-                    print(f"堆栈跟踪:")
+                    logging.info("堆栈跟踪:")
                     for i, frame in enumerate(stack):
-                        print(f"  #{i} {frame}")
-                print("")
+                        logging.info("  #{i} {}".format(frame))
+                logging.info("")
                 
         # 处理释放事件
         else:
@@ -687,15 +695,15 @@ def main():
                 if args.show_all:
                     ts = datetime.fromtimestamp(timestamp / 1000000000).strftime('%H:%M:%S.%f')
                     duration_ms = (timestamp - alloc.timestamp) / 1000000
-                    print(f"[{ts}] 释放: PID {pid} ({comm}) 地址:0x{addr:x} 大小:{human_size(alloc.size)} 持有时间:{duration_ms:.2f}ms")
+                    logging.info("[{}] 释放: PID {} ({}) 地址:0x{:x} 大小:{} 持有时间:{}ms".format(ts, pid, comm, addr, human_size(alloc.size), duration_ms))
                     
                     # 打印堆栈跟踪
                     if stack_id >= 0:
                         stack = get_stack_trace(b, stack_id, pid)
-                        print(f"释放堆栈:")
+                        logging.info("释放堆栈:")
                         for i, frame in enumerate(stack):
-                            print(f"  #{i} {frame}")
-                    print("")
+                            logging.info("  #{i} {}".format(frame))
+                    logging.info("")
                 
                 # 删除记录
                 del allocations[addr]
@@ -710,22 +718,22 @@ def main():
         total_leaked = sum(alloc.size for alloc in allocations.values())
         
         report_type = "最终" if final else "中间"
-        print(f"\n===== {report_type}内存报告 =====")
-        print(f"跟踪的进程: {'PID ' + str(args.pid) if args.pid else '所有进程'}")
-        print(f"最小跟踪大小: {human_size(args.min_size)}")
-        print(f"总分配次数: {alloc_count}")
-        print(f"总释放次数: {free_count}")
-        print(f"活跃分配数: {active_allocs}")
-        print(f"总泄漏内存: {human_size(total_leaked)}")
+        logging.info("\n===== {}内存报告 =====".format(report_type))
+        logging.info("跟踪的进程: {}".format('PID ' + str(args.pid) if args.pid else '所有进程'))
+        logging.info("最小跟踪大小: {}".format(human_size(args.min_size)))
+        logging.info("总分配次数: {}".format(alloc_count))
+        logging.info("总释放次数: {}".format(free_count))
+        logging.info("活跃分配数: {}".format(active_allocs))
+        logging.info("总泄漏内存: {}".format(human_size(total_leaked)))
         
         # 如果有活跃分配，打印详细信息
         if active_allocs > 0:
             # 按大小排序的分配
             sorted_allocs = sorted(allocations.values(), key=lambda x: x.size, reverse=True)
             
-            print("\n前 {} 个最大的未释放分配:".format(min(args.top, len(sorted_allocs))))
-            print(f"{'地址':<14} {'大小':<10} {'分配时间':<20} {'堆栈'}")
-            print("-" * 80)
+            logging.info("\n前 {} 个最大的未释放分配:".format(min(args.top, len(sorted_allocs))))
+            logging.info("{:<14} {:<10} {:<20} {}".format('地址', '大小', '分配时间', '堆栈'))
+            logging.info("-" * 80)
             
             # 获取进程内存映射信息
             maps = get_proc_maps(args.pid) if args.pid > 0 else []
@@ -741,12 +749,12 @@ def main():
                 # 查找内存映射
                 mapping = find_map_for_addr(alloc.address, maps) if args.pid > 0 else "[未知]"
                 
-                print(f"0x{alloc.address:<12x} {human_size(alloc.size):<10} {ts:<20} {stack_preview}")
+                logging.info("0x{:12x} {:<10} {:<20} {}".format(alloc.address, human_size(alloc.size), ts, stack_preview))
             
             # 按堆栈分组的泄漏
-            print("\n按堆栈分组的泄漏:")
-            print(f"{'未释放数量':<12} {'总大小':<12} {'分配次数':<12} {'泄漏堆栈'}")
-            print("-" * 80)
+            logging.info("\n按堆栈分组的泄漏:")
+            logging.info("{:<12} {:<12} {:<12} {}".format('未释放数量', '总大小', '分配次数', '泄漏堆栈'))
+            logging.info("-" * 80)
             
             stack_leaks = []
             for stack_str, count in stack_leak_count.items():
@@ -767,23 +775,23 @@ def main():
             stack_leaks.sort(key=lambda x: x[1], reverse=True)
             
             for i, (count, size, alloc_count, top_frame, stack_str) in enumerate(stack_leaks[:args.top]):
-                print(f"{count:<12} {human_size(size):<12} {alloc_count:<12} {top_frame}")
+                logging.info("{:<12} {:<12} {:<12} {}".format(count, human_size(size), alloc_count, top_frame))
                 
                 # 显示完整堆栈
                 if i < 3:  # 仅显示前3个泄漏的完整堆栈
-                    print("完整堆栈:")
+                    logging.info("完整堆栈:")
                     for j, frame in enumerate(stack_str.split('\n')):
                         if frame:  # 跳过空行
-                            print(f"  #{j} {frame}")
-                    print("")
+                            logging.info("  #{j} {}".format(frame))
+                    logging.info("")
     
     # 开始监控
     start_time = time.time()
-    print(f"开始监控{'PID ' + str(args.pid) if args.pid else '所有进程'} 的内存分配和释放...")
-    print(f"监控持续时间: {args.duration}秒")
-    print(f"报告间隔: {args.interval}秒")
-    print(f"最小跟踪大小: {human_size(args.min_size)}")
-    print(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logging.info("开始监控{} 的内存分配和释放...".format('PID ' + str(args.pid) if args.pid else '所有进程'))
+    logging.info("监控持续时间: {}秒".format(args.duration))
+    logging.info("报告间隔: {}秒".format(args.interval))
+    logging.info("最小跟踪大小: {}".format(human_size(args.min_size)))
+    logging.info("开始时间: {}".format(datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
     
     next_report = start_time + args.interval
     
@@ -795,15 +803,13 @@ def main():
             if time.time() >= next_report:
                 generate_report()
                 next_report = time.time() + args.interval
-                
     except KeyboardInterrupt:
         signal_handler(signal.SIGINT, None)
-    
-    # 最终报告
-    generate_report(final=True)
-    
-    # 清理资源
-    b.cleanup()
+    except Exception as e:
+        logging.exception("发生异常:")
+    finally:
+        generate_report(final=True)
+        b.cleanup()
 
 if __name__ == "__main__":
     main() 

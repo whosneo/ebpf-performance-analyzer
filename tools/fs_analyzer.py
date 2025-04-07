@@ -11,6 +11,11 @@ from bcc import BPF
 from datetime import datetime
 import ctypes as ct
 import os
+import logging
+
+# 导入公共模块
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from src.ebpf_common import BaseAnalyzer, validate_args, setup_logging, run_monitoring_loop
 
 # eBPF程序代码
 bpf_text = """
@@ -439,16 +444,27 @@ def parse_args():
         help="要监控的进程ID (0表示所有进程)")
     parser.add_argument("-d", "--duration", type=int, default=10,
         help="监控持续时间(秒)")
+    parser.add_argument("-i", "--interval", type=int, default=5,
+        help="报告间隔(秒)")
     parser.add_argument("-t", "--threshold", type=float, default=1.0,
         help="文件操作延迟阈值(毫秒)，只显示高于此阈值的操作")
     parser.add_argument("-f", "--filter", type=str, default="all",
         help="过滤器，可以是: all, read, write, open, close, fsync")
     parser.add_argument("--summary", action="store_true",
         help="输出操作统计摘要")
+    parser.add_argument("-v", "--verbose", action="store_true",
+        help="启用详细日志输出")
     return parser.parse_args()
 
 def main():
     args = parse_args()
+    
+    # 设置日志
+    setup_logging(args.verbose)
+    
+    # 参数校验
+    if not validate_args(args):
+        return 1
     
     # 设置操作过滤器
     op_filter = args.filter.lower()
@@ -460,122 +476,154 @@ def main():
         "close": [OP_CLOSE],
         "fsync": [OP_FSYNC]
     }
+    
+    if op_filter not in filter_map:
+        logging.error(f"无效的过滤器: {op_filter}，有效值为: all, read, write, open, close, fsync")
+        return 1
+        
     ops_to_monitor = filter_map.get(op_filter, filter_map["all"])
     
-    print(f"开始监控{'PID ' + str(args.pid) if args.pid else '所有进程'} 的文件操作...")
-    print(f"监控持续时间: {args.duration}秒")
-    print(f"延迟阈值: {args.threshold}ms")
-    print(f"监控操作类型: {', '.join([OP_NAMES[op] for op in ops_to_monitor])}")
-    
-    # 替换eBPF程序中的PID过滤器
-    bpf_program = bpf_text.replace('PID_FILTER', str(args.pid))
-    
-    # 加载eBPF程序
-    b = BPF(text=bpf_program)
-    
-    # 附加到文件系统相关的系统调用
-    b.attach_kprobe(event="vfs_read", fn_name="trace_read_entry")
-    b.attach_kretprobe(event="vfs_read", fn_name="trace_read_return")
-    
-    b.attach_kprobe(event="vfs_write", fn_name="trace_write_entry")
-    b.attach_kretprobe(event="vfs_write", fn_name="trace_write_return")
-    
-    b.attach_kprobe(event="do_sys_open", fn_name="trace_open_entry")
-    b.attach_kretprobe(event="do_sys_open", fn_name="trace_open_return")
-    
-    b.attach_kprobe(event="__close_fd", fn_name="trace_close_entry")
-    b.attach_kretprobe(event="__close_fd", fn_name="trace_close_return")
-    
-    b.attach_kprobe(event="vfs_fsync", fn_name="trace_fsync_entry")
-    b.attach_kretprobe(event="vfs_fsync", fn_name="trace_fsync_return")
-    
-    # 统计变量
-    stats = {
-        OP_READ: {"count": 0, "bytes": 0, "latency": 0, "errors": 0},
-        OP_WRITE: {"count": 0, "bytes": 0, "latency": 0, "errors": 0},
-        OP_OPEN: {"count": 0, "bytes": 0, "latency": 0, "errors": 0},
-        OP_CLOSE: {"count": 0, "bytes": 0, "latency": 0, "errors": 0},
-        OP_FSYNC: {"count": 0, "bytes": 0, "latency": 0, "errors": 0}
-    }
-    
-    # 定义事件回调
-    def event_callback(cpu, data, size):
-        event = ct.cast(data, ct.POINTER(FileOp)).contents
-        
-        # 根据操作类型过滤
-        if event.op not in ops_to_monitor:
-            return
-        
-        # 根据延迟阈值过滤
-        latency_ms = event.latency / 1000000
-        if latency_ms < args.threshold:
-            return
-        
-        # 更新统计信息
-        stats[event.op]["count"] += 1
-        stats[event.op]["bytes"] += event.bytes
-        stats[event.op]["latency"] += event.latency
-        if event.failed:
-            stats[event.op]["errors"] += 1
-        
-        # 格式化输出
-        op_name = OP_NAMES.get(event.op, f"未知({event.op})")
-        status = "失败" if event.failed else "成功"
-        timestamp = datetime.fromtimestamp(event.ts / 1000000000).strftime('%H:%M:%S.%f')
-        
-        print(f"[{timestamp}] PID: {event.pid} ({event.comm.decode('utf-8', 'replace')}), "
-              f"操作: {op_name}, 文件: {event.filename.decode('utf-8', 'replace')}, "
-              f"耗时: {latency_ms:.3f}ms, 字节数: {event.bytes}, 状态: {status}")
-    
-    # 注册事件回调
-    b["file_ops_events"].open_perf_buffer(event_callback)
-    
-    # 监控指定的时间
-    start_time = datetime.now()
-    print(f"开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logging.info(f"开始监控{'PID ' + str(args.pid) if args.pid else '所有进程'} 的文件操作...")
+    logging.info(f"监控持续时间: {args.duration}秒")
+    logging.info(f"报告间隔: {args.interval}秒")
+    logging.info(f"延迟阈值: {args.threshold}ms")
+    logging.info(f"监控操作类型: {', '.join([OP_NAMES[op] for op in ops_to_monitor])}")
     
     try:
-        while datetime.now() - start_time < datetime.timedelta(seconds=args.duration):
-            b.perf_buffer_poll(timeout=100)
-    except KeyboardInterrupt:
-        print("监控被用户中断")
-    
-    end_time = datetime.now()
-    print(f"结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"总监控时间: {(end_time - start_time).total_seconds():.2f}秒")
-    
-    # 输出统计摘要
-    if args.summary:
-        print("\n----- 文件操作统计摘要 -----")
-        print("%-10s %-12s %-15s %-15s %-10s" % (
-            "操作类型", "次数", "总字节数", "平均延迟(ms)", "错误次数"))
+        # 替换eBPF程序中的PID过滤器
+        bpf_program = bpf_text.replace('PID_FILTER', str(args.pid))
         
-        total_count = 0
-        total_bytes = 0
-        total_errors = 0
+        # 加载eBPF程序
+        b = BPF(text=bpf_program)
         
-        for op in [OP_READ, OP_WRITE, OP_OPEN, OP_CLOSE, OP_FSYNC]:
-            op_stats = stats[op]
-            count = op_stats["count"]
-            total_count += count
-            
-            bytes_count = op_stats["bytes"]
-            total_bytes += bytes_count
-            
-            avg_latency = op_stats["latency"] / count / 1000000 if count > 0 else 0
-            
-            errors = op_stats["errors"]
-            total_errors += errors
-            
-            print("%-10s %-12d %-15d %-15.3f %-10d" % (
-                OP_NAMES[op], count, bytes_count, avg_latency, errors))
+        # 附加到文件系统相关的系统调用
+        b.attach_kprobe(event="vfs_read", fn_name="trace_read_entry")
+        b.attach_kretprobe(event="vfs_read", fn_name="trace_read_return")
         
-        print("-" * 70)
-        print("%-10s %-12d %-15d %-15s %-10d" % (
-            "总计", total_count, total_bytes, "-", total_errors))
+        b.attach_kprobe(event="vfs_write", fn_name="trace_write_entry")
+        b.attach_kretprobe(event="vfs_write", fn_name="trace_write_return")
+        
+        b.attach_kprobe(event="do_sys_open", fn_name="trace_open_entry")
+        b.attach_kretprobe(event="do_sys_open", fn_name="trace_open_return")
+        
+        b.attach_kprobe(event="__close_fd", fn_name="trace_close_entry")
+        b.attach_kretprobe(event="__close_fd", fn_name="trace_close_return")
+        
+        b.attach_kprobe(event="vfs_fsync", fn_name="trace_fsync_entry")
+        b.attach_kretprobe(event="vfs_fsync", fn_name="trace_fsync_return")
+        
+        # 统计变量
+        stats = {
+            OP_READ: {"count": 0, "bytes": 0, "latency": 0, "errors": 0},
+            OP_WRITE: {"count": 0, "bytes": 0, "latency": 0, "errors": 0},
+            OP_OPEN: {"count": 0, "bytes": 0, "latency": 0, "errors": 0},
+            OP_CLOSE: {"count": 0, "bytes": 0, "latency": 0, "errors": 0},
+            OP_FSYNC: {"count": 0, "bytes": 0, "latency": 0, "errors": 0}
+        }
+        
+        # 定义事件回调
+        def event_callback(cpu, data, size):
+            try:
+                event = ct.cast(data, ct.POINTER(FileOp)).contents
+                
+                # 根据操作类型过滤
+                if event.op not in ops_to_monitor:
+                    return
+                
+                # 根据延迟阈值过滤
+                latency_ms = event.latency / 1000000
+                if latency_ms < args.threshold:
+                    return
+                
+                # 更新统计信息
+                stats[event.op]["count"] += 1
+                stats[event.op]["bytes"] += event.bytes
+                stats[event.op]["latency"] += event.latency
+                if event.failed:
+                    stats[event.op]["errors"] += 1
+                
+                # 格式化输出
+                op_name = OP_NAMES.get(event.op, f"未知({event.op})")
+                status = "失败" if event.failed else "成功"
+                timestamp = datetime.fromtimestamp(event.ts / 1000000000).strftime('%H:%M:%S.%f')
+                
+                logging.info(f"[{timestamp}] PID: {event.pid} ({event.comm.decode('utf-8', 'replace')}), "
+                          f"操作: {op_name}, 文件: {event.filename.decode('utf-8', 'replace')}, "
+                          f"耗时: {latency_ms:.3f}ms, 字节数: {event.bytes}, 状态: {status}")
+            except Exception as e:
+                logging.error(f"处理事件时出错: {str(e)}")
+        
+        # 注册事件回调
+        b["file_ops_events"].open_perf_buffer(event_callback)
+        
+        # 定期报告函数
+        def generate_summary():
+            if not args.summary:
+                return
+                
+            logging.info("\n----- 文件操作统计摘要 -----")
+            logging.info("%-10s %-12s %-15s %-15s %-10s" % (
+                "操作类型", "次数", "总字节数", "平均延迟(ms)", "错误次数"))
+            
+            total_count = 0
+            total_bytes = 0
+            total_errors = 0
+            
+            for op in [OP_READ, OP_WRITE, OP_OPEN, OP_CLOSE, OP_FSYNC]:
+                op_stats = stats[op]
+                count = op_stats["count"]
+                total_count += count
+                
+                bytes_count = op_stats["bytes"]
+                total_bytes += bytes_count
+                
+                avg_latency = op_stats["latency"] / count / 1000000 if count > 0 else 0
+                
+                errors = op_stats["errors"]
+                total_errors += errors
+                
+                logging.info("%-10s %-12d %-15d %-15.3f %-10d" % (
+                    OP_NAMES[op], count, bytes_count, avg_latency, errors))
+            
+            logging.info("-" * 70)
+            logging.info("%-10s %-12d %-15d %-15s %-10d" % (
+                "总计", total_count, total_bytes, "-", total_errors))
+        
+        # 监控指定的时间
+        start_time = datetime.now()
+        logging.info(f"开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        next_report = time.time() + args.interval
+        
+        try:
+            while (datetime.now() - start_time).total_seconds() < args.duration:
+                b.perf_buffer_poll(timeout=100)
+                
+                # 定期报告
+                if time.time() >= next_report:
+                    generate_summary()
+                    next_report = time.time() + args.interval
+                    
+        except KeyboardInterrupt:
+            logging.warning("监控被用户中断")
+        
+        end_time = datetime.now()
+        logging.info(f"结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        logging.info(f"总监控时间: {(end_time - start_time).total_seconds():.2f}秒")
+        
+        # 输出最终统计摘要
+        generate_summary()
+        
+    except Exception as e:
+        logging.exception(f"执行过程中发生错误: {str(e)}")
+        return 1
+    finally:
+        # 清理资源
+        if 'b' in locals():
+            b.cleanup()
     
-    # 清理资源
-    b.cleanup()
+    return 0
 
 if __name__ == "__main__":
-    main() 
+    exit_code = main()
+    sys.exit(exit_code) 

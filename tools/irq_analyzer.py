@@ -10,6 +10,12 @@ import argparse
 from bcc import BPF
 from datetime import datetime
 import ctypes as ct
+import os
+import logging
+
+# 导入公共模块
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from src.ebpf_common import BaseAnalyzer, validate_args, setup_logging, run_monitoring_loop
 
 # eBPF程序代码
 bpf_text = """
@@ -202,64 +208,41 @@ def parse_args():
         help="只显示硬中断")
     parser.add_argument("--softirq", action="store_true",
         help="只显示软中断")
+    parser.add_argument("-v", "--verbose", action="store_true",
+        help="启用详细日志输出")
+    parser.add_argument("-i", "--interval", type=int, default=5,
+        help="报告间隔(秒)")
     return parser.parse_args()
 
-def main():
-    args = parse_args()
-    
-    print("开始监控系统中断处理情况...")
-    print(f"监控持续时间: {args.duration}秒")
-    
-    # 加载eBPF程序
-    b = BPF(text=bpf_text)
-    
-    # 附加到中断处理相关的内核函数
-    b.attach_kprobe(event="handle_irq_event_percpu", fn_name="trace_irq_handler_entry")
-    b.attach_kretprobe(event="handle_irq_event_percpu", fn_name="trace_irq_handler_exit")
-    
-    # 附加到软中断处理相关的函数
-    b.attach_kprobe(event="__do_softirq", fn_name="trace_softirq_entry")
-    b.attach_kretprobe(event="__do_softirq", fn_name="trace_softirq_exit")
-    
-    # 监控指定的时间
-    start_time = datetime.now()
-    print(f"开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    try:
-        time.sleep(args.duration)
-    except KeyboardInterrupt:
-        print("监控被用户中断")
-    
-    end_time = datetime.now()
-    print(f"结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"总监控时间: {(end_time - start_time).total_seconds():.2f}秒")
-    
-    # 处理和分析收集的数据
-    irq_stats = b.get_table("irq_stats")
-    
+def process_irq_stats(irq_stats, args, duration):
+    """处理中断统计数据并生成报告"""
     # 创建中断统计列表
     irq_list = []
-    for k, v in irq_stats.items():
-        irq = k.irq
-        name = k.name.decode('utf-8', 'replace')
-        count = v.count
-        total_time = v.total_ns
-        avg_time = total_time / count if count > 0 else 0
-        max_time = v.max_ns
-        is_softirq = irq >= 1000
-        
-        # 根据过滤条件添加
-        if (args.hardirq and is_softirq) or (args.softirq and not is_softirq):
-            continue
+    try:
+        for k, v in irq_stats.items():
+            irq = k.irq
+            name = k.name.decode('utf-8', 'replace')
+            count = v.count
+            total_time = v.total_ns
+            avg_time = total_time / count if count > 0 else 0
+            max_time = v.max_ns
+            is_softirq = irq >= 1000
             
-        irq_list.append((irq, name, count, avg_time, max_time, total_time, is_softirq))
+            # 根据过滤条件添加
+            if (args.hardirq and is_softirq) or (args.softirq and not is_softirq):
+                continue
+                
+            irq_list.append((irq, name, count, avg_time, max_time, total_time, is_softirq))
+    except Exception as e:
+        logging.error(f"处理中断统计时出错: {str(e)}")
+        return None
     
     # 按中断频率排序
     sorted_irqs = sorted(irq_list, key=lambda x: x[2], reverse=True)
     
     # 显示中断统计
-    print("\n----- 中断处理统计 (按频率排序) -----")
-    print("%-6s %-20s %-10s %-16s %-16s %-10s" % (
+    logging.info("\n----- 中断处理统计 (按频率排序) -----")
+    logging.info("%-6s %-20s %-10s %-16s %-16s %-10s" % (
         "中断号", "名称", "计数", "平均时间(µs)", "最长时间(µs)", "类型"))
     
     for i, (irq, name, count, avg_time, max_time, total_time, is_softirq) in enumerate(sorted_irqs[:args.top]):
@@ -269,7 +252,7 @@ def main():
         else:
             irq_num = irq
             
-        print("%-6d %-20s %-10d %-16.2f %-16.2f %-10s" % (
+        logging.info("%-6d %-20s %-10d %-16.2f %-16.2f %-10s" % (
             irq_num, name, count, avg_time / 1000, max_time / 1000, irq_type))
     
     # 显示总的中断统计
@@ -281,20 +264,91 @@ def main():
     total_hard_time = sum(x[5] for x in hard_irqs)
     total_soft_time = sum(x[5] for x in soft_irqs)
     
-    print("\n----- 中断总结 -----")
-    print(f"硬中断总数: {total_hard_count} 次, 总处理时间: {total_hard_time/1e9:.6f} 秒")
-    print(f"软中断总数: {total_soft_count} 次, 总处理时间: {total_soft_time/1e9:.6f} 秒")
-    print(f"中断总数: {total_hard_count + total_soft_count} 次")
-    print(f"中断总处理时间: {(total_hard_time + total_soft_time)/1e9:.6f} 秒")
+    logging.info("\n----- 中断总结 -----")
+    logging.info(f"硬中断总数: {total_hard_count} 次, 总处理时间: {total_hard_time/1e9:.6f} 秒")
+    logging.info(f"软中断总数: {total_soft_count} 次, 总处理时间: {total_soft_time/1e9:.6f} 秒")
+    logging.info(f"中断总数: {total_hard_count + total_soft_count} 次")
+    logging.info(f"中断总处理时间: {(total_hard_time + total_soft_time)/1e9:.6f} 秒")
     
     # 显示中断频率
-    duration = (end_time - start_time).total_seconds()
-    print(f"硬中断频率: {total_hard_count/duration:.2f} 次/秒")
-    print(f"软中断频率: {total_soft_count/duration:.2f} 次/秒")
-    print(f"总中断频率: {(total_hard_count + total_soft_count)/duration:.2f} 次/秒")
+    logging.info(f"硬中断频率: {total_hard_count/duration:.2f} 次/秒")
+    logging.info(f"软中断频率: {total_soft_count/duration:.2f} 次/秒")
+    logging.info(f"总中断频率: {(total_hard_count + total_soft_count)/duration:.2f} 次/秒")
     
-    # 清理资源
-    b.cleanup()
+    return sorted_irqs
+
+def main():
+    args = parse_args()
+    
+    # 设置日志
+    setup_logging(args.verbose)
+    
+    # 参数校验
+    if not validate_args(args):
+        return 1
+    
+    logging.info("开始监控系统中断处理情况...")
+    logging.info(f"监控持续时间: {args.duration}秒")
+    logging.info(f"报告间隔: {args.interval}秒")
+    if args.hardirq:
+        logging.info("仅监控硬中断")
+    if args.softirq:
+        logging.info("仅监控软中断")
+    
+    try:
+        # 加载eBPF程序
+        b = BPF(text=bpf_text)
+        
+        # 附加到中断处理相关的内核函数
+        b.attach_kprobe(event="handle_irq_event_percpu", fn_name="trace_irq_handler_entry")
+        b.attach_kretprobe(event="handle_irq_event_percpu", fn_name="trace_irq_handler_exit")
+        
+        # 附加到软中断处理相关的函数
+        b.attach_kprobe(event="__do_softirq", fn_name="trace_softirq_entry")
+        b.attach_kretprobe(event="__do_softirq", fn_name="trace_softirq_exit")
+        
+        # 监控指定的时间
+        start_time = datetime.now()
+        logging.info(f"开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # 定期报告函数
+        next_report = time.time() + args.interval
+        
+        def periodic_report():
+            nonlocal next_report
+            if time.time() >= next_report:
+                elapsed = (datetime.now() - start_time).total_seconds()
+                logging.info(f"\n===== 中间报告 ({elapsed:.1f}秒) =====")
+                process_irq_stats(b.get_table("irq_stats"), args, elapsed)
+                next_report = time.time() + args.interval
+        
+        # 监控循环
+        try:
+            while (datetime.now() - start_time).total_seconds() < args.duration:
+                b.perf_buffer_poll(timeout=100)
+                periodic_report()
+        except KeyboardInterrupt:
+            logging.warning("监控被用户中断")
+        
+        end_time = datetime.now()
+        logging.info(f"结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        elapsed = (end_time - start_time).total_seconds()
+        logging.info(f"总监控时间: {elapsed:.2f}秒")
+        
+        # 最终报告
+        logging.info("\n===== 最终报告 =====")
+        process_irq_stats(b.get_table("irq_stats"), args, elapsed)
+        
+    except Exception as e:
+        logging.exception(f"执行过程中发生错误: {str(e)}")
+        return 1
+    finally:
+        # 清理资源
+        if 'b' in locals():
+            b.cleanup()
+    
+    return 0
 
 if __name__ == "__main__":
-    main() 
+    exit_code = main()
+    sys.exit(exit_code) 

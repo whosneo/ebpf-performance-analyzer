@@ -7,9 +7,15 @@
 import sys
 import time
 import argparse
+import os
 from bcc import BPF
 from datetime import datetime
 import ctypes as ct
+import logging
+
+# 导入公共模块
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from src.ebpf_common import BaseAnalyzer, setup_signal_handler, human_readable_size
 
 # eBPF程序代码
 bpf_text = """
@@ -164,143 +170,169 @@ class AddrInfo(ct.Structure):
         ("stack_id", ct.c_uint),
     ]
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="内存分析工具 - 跟踪内存分配和释放")
-    parser.add_argument("pid", type=int, nargs="?", default=0,
-        help="要监控的进程ID (0表示所有进程)")
-    parser.add_argument("-d", "--duration", type=int, default=10,
-        help="监控持续时间(秒)")
-    parser.add_argument("-t", "--top", type=int, default=10,
-        help="显示内存占用最高的前N个堆栈")
-    parser.add_argument("-l", "--leaks", action="store_true",
-        help="只显示可能的内存泄漏")
-    return parser.parse_args()
-
 def get_stack_trace(bpf, stack_id):
-    if stack_id < 0:
-        return "未知堆栈"
-    
-    stack = list(bpf.get_table("stack_traces").walk(stack_id))
-    if not stack:
-        return "空堆栈"
-    
+    """将堆栈ID转换为可读字符串"""
     try:
+        if stack_id < 0:
+            return "未知堆栈"
+        
+        stack = list(bpf.get_table("stack_traces").walk(stack_id))
+        if not stack:
+            return "空堆栈"
+        
         kernel_stack = []
         for addr in stack:
             kernel_stack.append(f"{bpf.ksym(addr).decode('utf-8', 'replace')} [{addr:x}]")
+        
         return "\n\t".join(kernel_stack)
-    except:
+    except Exception as e:
+        logging.warning(f"解析堆栈ID {stack_id} 时出错: {str(e)}")
         return f"无法解析堆栈ID {stack_id}"
 
-def main():
-    args = parse_args()
+def analyze_memory_usage(bpf, args, final=False):
+    """分析内存使用情况并输出报告"""
     
-    print(f"开始监控{'PID ' + str(args.pid) if args.pid else '所有进程'} 的内存分配情况...")
-    print(f"监控持续时间: {args.duration}秒")
+    # 从BPF表获取数据
+    stack_stats = bpf.get_table("stack_stats")
+    addr_table = bpf.get_table("addr_info")
     
-    # 替换eBPF程序中的PID过滤器
-    bpf_program = bpf_text.replace('PID_FILTER', str(args.pid))
+    if len(stack_stats) == 0:
+        logging.warning("未收集到内存分配数据，请检查PID是否正确或程序是否有内存活动")
+        return
     
-    # 加载eBPF程序
-    b = BPF(text=bpf_program)
-    b.attach_kprobe(event="__kmalloc", fn_name="trace_alloc")
-    b.attach_kretprobe(event="__kmalloc", fn_name="trace_alloc_ret")
-    b.attach_kprobe(event="kfree", fn_name="trace_free")
-    
-    # 监控指定的时间
-    start_time = datetime.now()
-    print(f"开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    try:
-        time.sleep(args.duration)
-    except KeyboardInterrupt:
-        print("监控被用户中断")
-    
-    end_time = datetime.now()
-    print(f"结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"总监控时间: {(end_time - start_time).total_seconds():.2f}秒")
-    
-    # 获取数据
-    stack_stats = b.get_table("stack_stats")
-    addr_info = b.get_table("addr_info")
-    
-    # 统计数据
+    # 计算总体统计信息
     total_allocs = 0
     total_frees = 0
-    total_mem = 0
-    leaked_mem = 0
-    active_allocs = 0
+    total_active_size = 0
+    stack_data = []
     
-    # 收集堆栈统计信息
-    stacks_data = []
     for stack_id, stat in stack_stats.items():
         stat_val = ct.cast(stat, ct.POINTER(StackStat)).contents
         
-        # 计算堆栈的内存泄漏
-        alloc_count = stat_val.alloc_count
-        free_count = stat_val.free_count
-        current_size = stat_val.total_size
+        # 计算总计
+        total_allocs += stat_val.alloc_count
+        total_frees += stat_val.free_count
+        total_active_size += stat_val.total_size
         
-        # 更新总体统计信息
-        total_allocs += alloc_count
-        total_frees += free_count
-        total_mem += current_size
+        # 是否有泄漏
+        active_allocs = stat_val.alloc_count - stat_val.free_count
         
-        if alloc_count > free_count:
-            leaked_allocs = alloc_count - free_count
-            active_allocs += leaked_allocs
-            
-            # 收集堆栈信息
-            stack_trace = get_stack_trace(b, stack_id.value)
-            
-            # 判断是否可能的内存泄漏
-            possible_leak = (alloc_count > free_count + 2) 
-            
-            # 如果只查看泄漏，且不是可能的泄漏，则跳过
-            if args.leaks and not possible_leak:
-                continue
-            
-            stacks_data.append({
-                "stack_id": stack_id.value,
-                "stack_trace": stack_trace,
-                "alloc_count": alloc_count,
-                "free_count": free_count,
-                "diff": alloc_count - free_count,
-                "size": current_size,
-                "is_leak": possible_leak
-            })
+        # 如果只显示泄漏且该堆栈无泄漏，则跳过
+        if args.leaks and active_allocs <= 0:
+            continue
+        
+        # 获取堆栈信息
+        stack_trace = get_stack_trace(bpf, stack_id.value)
+        
+        # 添加到结果列表
+        stack_data.append({
+            'stack_id': stack_id.value,
+            'alloc_count': stat_val.alloc_count,
+            'free_count': stat_val.free_count,
+            'active_allocs': active_allocs,
+            'total_size': stat_val.total_size,
+            'stack_trace': stack_trace,
+            'is_leak': active_allocs > 0
+        })
     
-    # 按内存大小排序
-    stacks_data.sort(key=lambda x: x["size"], reverse=True)
+    # 排序堆栈数据 - 按内存大小倒序
+    stack_data.sort(key=lambda x: x['total_size'], reverse=True)
     
-    # 显示泄漏检测结果
-    print("\n===== 内存分配统计 =====")
+    # 显示总体统计
+    if final:
+        print("\n===== 内存分配统计 =====")
+    else:
+        print("\n===== 内存分配中间统计 =====")
+        
     print(f"总分配次数: {total_allocs}")
     print(f"总释放次数: {total_frees}")
-    print(f"未释放分配次数: {active_allocs}")
-    print(f"总活跃内存: {total_mem/1024:.2f} KB")
+    print(f"未释放分配次数: {total_allocs - total_frees}")
+    print(f"总活跃内存: {human_readable_size(total_active_size)}")
     
-    # 显示前N个内存占用最大的堆栈
-    print(f"\n===== 内存占用前 {args.top} 的堆栈 =====")
-    for i, data in enumerate(stacks_data[:args.top]):
-        if args.leaks and not data["is_leak"]:
-            continue
+    # 显示堆栈详情
+    limit = min(args.top, len(stack_data))
+    print(f"\n===== 内存占用前 {limit} 的堆栈 =====")
+    
+    for i, data in enumerate(stack_data[:limit]):
+        leak_text = "[可能泄漏] " if data['is_leak'] else ""
+        print(f"#{i+1} {leak_text}{human_readable_size(data['total_size'])}")
+        print(f"    分配: {data['alloc_count']}, 释放: {data['free_count']}, 差值: {data['active_allocs']}")
+        print("调用堆栈:")
+        print(f"    {data['stack_trace']}")
+        print()
+
+class MemoryAnalyzer(BaseAnalyzer):
+    """内存分析器类"""
+    
+    def __init__(self):
+        super().__init__(
+            name="内存分析器",
+            description="跟踪内存分配和释放，分析内存使用模式"
+        )
+    
+    def setup_args(self):
+        """设置命令行参数解析器"""
+        parser = super().setup_args()
+        parser.add_argument("-l", "--leaks", action="store_true",
+            help="只显示可能的内存泄漏")
+        return parser
+    
+    def run(self):
+        """运行内存分析器"""
+        # 解析参数
+        self.parse_args()
+        if not self.validate_args():
+            return 1
+        
+        # 设置日志
+        self.setup_logging()
+        
+        try:
+            # 加载BPF程序
+            logging.info(f"开始监控{'PID ' + str(self.args.pid) if self.args.pid > 0 else '所有进程'}的内存分配情况...")
+            logging.info(f"监控持续时间: {self.args.duration}秒")
+            logging.info(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             
-        print(f"\n#{i+1} {'[可能泄漏] ' if data['is_leak'] else ''}{data['size']/1024:.2f} KB")
-        print(f"    分配: {data['alloc_count']}, 释放: {data['free_count']}, 差值: {data['diff']}")
-        print("\n调用堆栈:")
-        print(f"\t{data['stack_trace']}")
-        print("-" * 80)
-    
-    # 显示活跃的地址信息数量
-    print(f"\n当前跟踪的活跃内存分配: {len(addr_info)} 个")
-    
-    # 清理资源
-    b.cleanup()
+            # 替换PID占位符
+            bpf_code = bpf_text.replace('PID_FILTER', str(self.args.pid))
+            b = self.load_bpf(bpf_code)
+            
+            # 附加kprobe
+            b.attach_kprobe(event="__kmalloc", fn_name="trace_alloc")
+            b.attach_kretprobe(event="__kmalloc", fn_name="trace_alloc_ret")
+            b.attach_kprobe(event="kfree", fn_name="trace_free")
+            
+            # 设置信号处理
+            setup_signal_handler(lambda: self.cleanup())
+            
+            # 设置中间报告回调
+            start_time = time.time()
+            next_report = start_time + self.args.interval
+            
+            # 监控循环
+            while time.time() - start_time < self.args.duration:
+                try:
+                    time.sleep(1)
+                    if time.time() >= next_report:
+                        analyze_memory_usage(b, self.args)
+                        next_report = time.time() + self.args.interval
+                except KeyboardInterrupt:
+                    break
+            
+            # 显示最终报告
+            end_time = time.time()
+            logging.info(f"结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logging.info(f"总监控时间: {end_time - start_time:.2f}秒")
+            analyze_memory_usage(b, self.args, final=True)
+            
+            return 0
+            
+        except Exception as e:
+            logging.error(f"运行内存分析器时发生错误: {str(e)}")
+            return 1
+        finally:
+            self.cleanup()
 
 if __name__ == "__main__":
-    if not BPF.support_kfunc():
-        print("警告: 内核版本可能不完全支持eBPF kfunc功能，某些特性可能无法正常工作")
-    
-    main() 
+    analyzer = MemoryAnalyzer()
+    sys.exit(analyzer.run()) 

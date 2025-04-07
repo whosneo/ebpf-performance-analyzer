@@ -10,6 +10,12 @@ import argparse
 from bcc import BPF
 from datetime import datetime
 import ctypes as ct
+import os
+import logging
+
+# 导入公共模块
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from src.ebpf_common import validate_args, setup_logging, setup_signal_handler
 
 # eBPF程序代码
 bpf_text = """
@@ -428,6 +434,8 @@ def parse_args():
         help="要监控的进程ID (0表示所有进程)")
     parser.add_argument("-d", "--duration", type=int, default=10,
         help="监控持续时间(秒)")
+    parser.add_argument("-i", "--interval", type=int, default=5,
+        help="报告间隔(秒)")
     parser.add_argument("-t", "--type", type=str, default="all",
         help="缓存类型过滤器(all, page, slab, inode, dentry)")
     parser.add_argument("-o", "--operation", type=str, default="all",
@@ -436,10 +444,76 @@ def parse_args():
         help="采样率(每N个事件只显示1个，0表示不采样)")
     parser.add_argument("--summary", action="store_true",
         help="只显示摘要统计")
+    parser.add_argument("-v", "--verbose", action="store_true",
+        help="启用详细日志输出")
     return parser.parse_args()
+
+def generate_cache_summary(accumulated_stats, process_stats, types_to_monitor, args):
+    """生成缓存使用摘要报告"""
+    try:
+        # 输出缓存统计摘要
+        logging.info("\n----- 缓存命中率统计 -----")
+        for cache_type in types_to_monitor:
+            type_name = CACHE_TYPE_NAMES[cache_type]
+            hits = accumulated_stats[cache_type]["hit"]
+            misses = accumulated_stats[cache_type]["miss"]
+            allocs = accumulated_stats[cache_type]["alloc"]
+            frees = accumulated_stats[cache_type]["free"]
+            
+            total_accesses = hits + misses
+            hit_rate = (hits / total_accesses * 100) if total_accesses > 0 else 0
+            
+            logging.info(f"{type_name}:")
+            logging.info(f"  命中: {hits}, 未命中: {misses}, 命中率: {hit_rate:.2f}%")
+            logging.info(f"  分配: {allocs}, 释放: {frees}, 净分配: {allocs - frees}")
+        
+        # 输出每个进程的缓存统计
+        logging.info("\n----- 进程缓存统计 -----")
+        
+        # 按总缓存访问量排序进程
+        def get_total_accesses(pid_stats):
+            pid, stats = pid_stats
+            total = 0
+            for cache_type in types_to_monitor:
+                total += stats["types"][cache_type]["hit"] + stats["types"][cache_type]["miss"]
+            return total
+        
+        sorted_processes = sorted(process_stats.items(), key=get_total_accesses, reverse=True)
+        
+        # 显示前10个进程
+        for pid, stats in sorted_processes[:10]:
+            process_name = stats["name"]
+            logging.info(f"\nPID: {pid} ({process_name})")
+            
+            for cache_type in types_to_monitor:
+                type_name = CACHE_TYPE_NAMES[cache_type]
+                type_stats = stats["types"][cache_type]
+                hits = type_stats["hit"]
+                misses = type_stats["miss"]
+                allocs = type_stats["alloc"]
+                frees = type_stats["free"]
+                
+                total_accesses = hits + misses
+                hit_rate = (hits / total_accesses * 100) if total_accesses > 0 else 0
+                
+                logging.info(f"  {type_name}:")
+                logging.info(f"    命中: {hits}, 未命中: {misses}, 命中率: {hit_rate:.2f}%")
+                logging.info(f"    分配: {allocs}, 释放: {frees}, 净分配: {allocs - frees}")
+                
+        return sorted_processes
+    except Exception as e:
+        logging.error(f"生成缓存摘要时出错: {str(e)}")
+        return None
 
 def main():
     args = parse_args()
+    
+    # 设置日志
+    setup_logging(args.verbose)
+    
+    # 参数校验
+    if not validate_args(args):
+        return 1
     
     # 设置缓存类型过滤器
     cache_type_filter = args.type.lower()
@@ -450,6 +524,11 @@ def main():
         "inode": [CACHE_TYPE_INODE],
         "dentry": [CACHE_TYPE_DENTRY]
     }
+    
+    if cache_type_filter not in type_filter_map:
+        logging.error(f"无效的缓存类型过滤器: {cache_type_filter}, 有效值为: all, page, slab, inode, dentry")
+        return 1
+        
     types_to_monitor = type_filter_map.get(cache_type_filter, type_filter_map["all"])
     
     # 设置操作类型过滤器
@@ -461,179 +540,173 @@ def main():
         "alloc": [CACHE_OP_ALLOC],
         "free": [CACHE_OP_FREE]
     }
+    
+    if op_filter not in op_filter_map:
+        logging.error(f"无效的操作类型过滤器: {op_filter}, 有效值为: all, hit, miss, alloc, free")
+        return 1
+        
     ops_to_monitor = op_filter_map.get(op_filter, op_filter_map["all"])
     
-    print(f"开始监控{'PID ' + str(args.pid) if args.pid else '所有进程'} 的缓存活动...")
-    print(f"监控持续时间: {args.duration}秒")
-    print(f"监控缓存类型: {', '.join([CACHE_TYPE_NAMES[t] for t in types_to_monitor])}")
-    print(f"监控操作类型: {', '.join([CACHE_OP_NAMES[o] for o in ops_to_monitor])}")
+    logging.info(f"开始监控{'PID ' + str(args.pid) if args.pid else '所有进程'} 的缓存活动...")
+    logging.info(f"监控持续时间: {args.duration}秒")
+    logging.info(f"报告间隔: {args.interval}秒")
+    logging.info(f"监控缓存类型: {', '.join([CACHE_TYPE_NAMES[t] for t in types_to_monitor])}")
+    logging.info(f"监控操作类型: {', '.join([CACHE_OP_NAMES[o] for o in ops_to_monitor])}")
     
     if args.sample > 0:
-        print(f"采样率: 每 {args.sample} 个事件显示1个")
-    
-    # 替换eBPF程序中的PID过滤器
-    bpf_program = bpf_text.replace('PID_FILTER', str(args.pid))
-    
-    # 加载eBPF程序
-    b = BPF(text=bpf_program)
-    
-    # 附加到页面缓存相关函数
-    b.attach_kprobe(event="mark_page_accessed", fn_name="trace_page_cache_hit")
-    b.attach_kprobe(event="filemap_fault", fn_name="trace_page_cache_miss")
-    
-    # 附加到inode缓存相关函数
-    b.attach_kprobe(event="find_inode_fast", fn_name="trace_inode_cache_hit")
-    b.attach_kprobe(event="alloc_inode", fn_name="trace_inode_cache_alloc")
-    b.attach_kprobe(event="destroy_inode", fn_name="trace_inode_cache_free")
-    
-    # 附加到dentry缓存相关函数
-    b.attach_kprobe(event="d_lookup", fn_name="trace_dentry_cache_hit")
-    b.attach_kprobe(event="d_alloc", fn_name="trace_dentry_cache_alloc")
-    b.attach_kprobe(event="d_free", fn_name="trace_dentry_cache_free")
-    
-    # 附加到slab分配相关函数
-    b.attach_kprobe(event="kmem_cache_alloc", fn_name="trace_kmem_cache_alloc")
-    b.attach_kprobe(event="kmem_cache_free", fn_name="trace_kmem_cache_free")
-    
-    # 用于采样和累积统计
-    event_count = 0
-    
-    # 类型和操作的累积统计
-    accumulated_stats = {
-        CACHE_TYPE_PAGE: {"hit": 0, "miss": 0, "alloc": 0, "free": 0},
-        CACHE_TYPE_SLAB: {"hit": 0, "miss": 0, "alloc": 0, "free": 0},
-        CACHE_TYPE_INODE: {"hit": 0, "miss": 0, "alloc": 0, "free": 0},
-        CACHE_TYPE_DENTRY: {"hit": 0, "miss": 0, "alloc": 0, "free": 0}
-    }
-    
-    # 进程级统计
-    process_stats = {}
-    
-    # 定义事件回调
-    def event_callback(cpu, data, size):
-        nonlocal event_count
-        event = ct.cast(data, ct.POINTER(CacheEvent)).contents
-        
-        # 根据过滤器过滤事件
-        if event.type not in types_to_monitor or event.op not in ops_to_monitor:
-            return
-        
-        # 更新累积统计
-        if event.op == CACHE_OP_HIT:
-            accumulated_stats[event.type]["hit"] += event.count
-        elif event.op == CACHE_OP_MISS:
-            accumulated_stats[event.type]["miss"] += event.count
-        elif event.op == CACHE_OP_ALLOC:
-            accumulated_stats[event.type]["alloc"] += event.count
-        elif event.op == CACHE_OP_FREE:
-            accumulated_stats[event.type]["free"] += event.count
-        
-        # 更新进程级统计
-        process_name = event.comm.decode('utf-8', 'replace')
-        if event.pid not in process_stats:
-            process_stats[event.pid] = {
-                "name": process_name,
-                "types": {
-                    CACHE_TYPE_PAGE: {"hit": 0, "miss": 0, "alloc": 0, "free": 0},
-                    CACHE_TYPE_SLAB: {"hit": 0, "miss": 0, "alloc": 0, "free": 0},
-                    CACHE_TYPE_INODE: {"hit": 0, "miss": 0, "alloc": 0, "free": 0},
-                    CACHE_TYPE_DENTRY: {"hit": 0, "miss": 0, "alloc": 0, "free": 0}
-                }
-            }
-        
-        # 更新进程缓存统计
-        if event.op == CACHE_OP_HIT:
-            process_stats[event.pid]["types"][event.type]["hit"] += event.count
-        elif event.op == CACHE_OP_MISS:
-            process_stats[event.pid]["types"][event.type]["miss"] += event.count
-        elif event.op == CACHE_OP_ALLOC:
-            process_stats[event.pid]["types"][event.type]["alloc"] += event.count
-        elif event.op == CACHE_OP_FREE:
-            process_stats[event.pid]["types"][event.type]["free"] += event.count
-        
-        # 如果不是只显示摘要，则输出实时事件
-        if not args.summary:
-            # 采样处理
-            event_count += 1
-            if args.sample > 0 and event_count % args.sample != 0:
-                return
-            
-            # 格式化输出
-            timestamp = datetime.fromtimestamp(event.ts / 1000000000).strftime('%H:%M:%S.%f')
-            cache_type = CACHE_TYPE_NAMES.get(event.type, f"未知({event.type})")
-            op_name = CACHE_OP_NAMES.get(event.op, f"未知({event.op})")
-            
-            print(f"[{timestamp}] PID: {event.pid} ({process_name}), "
-                  f"缓存类型: {cache_type}, 操作: {op_name}, 计数: {event.count}")
-    
-    # 注册事件回调
-    b["cache_events"].open_perf_buffer(event_callback)
-    
-    # 监控指定的时间
-    start_time = datetime.now()
-    print(f"开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        logging.info(f"采样率: 每 {args.sample} 个事件显示1个")
     
     try:
-        while datetime.now() - start_time < datetime.timedelta(seconds=args.duration):
-            b.perf_buffer_poll(timeout=100)
-    except KeyboardInterrupt:
-        print("监控被用户中断")
-    
-    end_time = datetime.now()
-    print(f"结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"总监控时间: {(end_time - start_time).total_seconds():.2f}秒")
-    
-    # 输出缓存统计摘要
-    print("\n----- 缓存命中率统计 -----")
-    for cache_type in types_to_monitor:
-        type_name = CACHE_TYPE_NAMES[cache_type]
-        hits = accumulated_stats[cache_type]["hit"]
-        misses = accumulated_stats[cache_type]["miss"]
-        allocs = accumulated_stats[cache_type]["alloc"]
-        frees = accumulated_stats[cache_type]["free"]
+        # 替换eBPF程序中的PID过滤器
+        bpf_program = bpf_text.replace('PID_FILTER', str(args.pid))
         
-        total_accesses = hits + misses
-        hit_rate = (hits / total_accesses * 100) if total_accesses > 0 else 0
+        # 加载eBPF程序
+        b = BPF(text=bpf_program)
         
-        print(f"{type_name}:")
-        print(f"  命中: {hits}, 未命中: {misses}, 命中率: {hit_rate:.2f}%")
-        print(f"  分配: {allocs}, 释放: {frees}, 净分配: {allocs - frees}")
-    
-    # 输出每个进程的缓存统计
-    print("\n----- 进程缓存统计 -----")
-    
-    # 按总缓存访问量排序进程
-    def get_total_accesses(pid_stats):
-        pid, stats = pid_stats
-        total = 0
-        for cache_type in types_to_monitor:
-            total += stats["types"][cache_type]["hit"] + stats["types"][cache_type]["miss"]
-        return total
-    
-    sorted_processes = sorted(process_stats.items(), key=get_total_accesses, reverse=True)
-    
-    # 显示前10个进程
-    for pid, stats in sorted_processes[:10]:
-        process_name = stats["name"]
-        print(f"\nPID: {pid} ({process_name})")
+        # 附加到页面缓存相关函数
+        b.attach_kprobe(event="mark_page_accessed", fn_name="trace_page_cache_hit")
+        b.attach_kprobe(event="filemap_fault", fn_name="trace_page_cache_miss")
         
-        for cache_type in types_to_monitor:
-            type_name = CACHE_TYPE_NAMES[cache_type]
-            type_stats = stats["types"][cache_type]
-            hits = type_stats["hit"]
-            misses = type_stats["miss"]
-            allocs = type_stats["alloc"]
-            frees = type_stats["free"]
-            
-            total_accesses = hits + misses
-            hit_rate = (hits / total_accesses * 100) if total_accesses > 0 else 0
-            
-            print(f"  {type_name}:")
-            print(f"    命中: {hits}, 未命中: {misses}, 命中率: {hit_rate:.2f}%")
-            print(f"    分配: {allocs}, 释放: {frees}, 净分配: {allocs - frees}")
+        # 附加到inode缓存相关函数
+        b.attach_kprobe(event="find_inode_fast", fn_name="trace_inode_cache_hit")
+        b.attach_kprobe(event="alloc_inode", fn_name="trace_inode_cache_alloc")
+        b.attach_kprobe(event="destroy_inode", fn_name="trace_inode_cache_free")
+        
+        # 附加到dentry缓存相关函数
+        b.attach_kprobe(event="d_lookup", fn_name="trace_dentry_cache_hit")
+        b.attach_kprobe(event="d_alloc", fn_name="trace_dentry_cache_alloc")
+        b.attach_kprobe(event="d_free", fn_name="trace_dentry_cache_free")
+        
+        # 附加到slab分配相关函数
+        b.attach_kprobe(event="kmem_cache_alloc", fn_name="trace_kmem_cache_alloc")
+        b.attach_kprobe(event="kmem_cache_free", fn_name="trace_kmem_cache_free")
+        
+        # 用于采样和累积统计
+        event_count = 0
+        
+        # 类型和操作的累积统计
+        accumulated_stats = {
+            CACHE_TYPE_PAGE: {"hit": 0, "miss": 0, "alloc": 0, "free": 0},
+            CACHE_TYPE_SLAB: {"hit": 0, "miss": 0, "alloc": 0, "free": 0},
+            CACHE_TYPE_INODE: {"hit": 0, "miss": 0, "alloc": 0, "free": 0},
+            CACHE_TYPE_DENTRY: {"hit": 0, "miss": 0, "alloc": 0, "free": 0}
+        }
+        
+        # 进程级统计
+        process_stats = {}
+        
+        # 定义用于清理资源的函数
+        def cleanup():
+            if 'b' in locals():
+                b.cleanup()
+        
+        # 设置信号处理器
+        setup_signal_handler(cleanup)
+        
+        # 定义事件回调
+        def event_callback(cpu, data, size):
+            try:
+                nonlocal event_count
+                event = ct.cast(data, ct.POINTER(CacheEvent)).contents
+                
+                # 根据过滤器过滤事件
+                if event.type not in types_to_monitor or event.op not in ops_to_monitor:
+                    return
+                
+                # 更新累积统计
+                op_name = ""
+                if event.op == CACHE_OP_HIT:
+                    accumulated_stats[event.type]["hit"] += event.count
+                    op_name = "hit"
+                elif event.op == CACHE_OP_MISS:
+                    accumulated_stats[event.type]["miss"] += event.count
+                    op_name = "miss"
+                elif event.op == CACHE_OP_ALLOC:
+                    accumulated_stats[event.type]["alloc"] += event.count
+                    op_name = "alloc"
+                elif event.op == CACHE_OP_FREE:
+                    accumulated_stats[event.type]["free"] += event.count
+                    op_name = "free"
+                
+                # 更新进程级统计
+                process_name = event.comm.decode('utf-8', 'replace')
+                if event.pid not in process_stats:
+                    process_stats[event.pid] = {
+                        "name": process_name,
+                        "types": {
+                            CACHE_TYPE_PAGE: {"hit": 0, "miss": 0, "alloc": 0, "free": 0},
+                            CACHE_TYPE_SLAB: {"hit": 0, "miss": 0, "alloc": 0, "free": 0},
+                            CACHE_TYPE_INODE: {"hit": 0, "miss": 0, "alloc": 0, "free": 0},
+                            CACHE_TYPE_DENTRY: {"hit": 0, "miss": 0, "alloc": 0, "free": 0}
+                        }
+                    }
+                
+                # 更新进程缓存统计
+                if op_name:
+                    process_stats[event.pid]["types"][event.type][op_name] += event.count
+                
+                # 如果不是只显示摘要，则输出实时事件
+                if not args.summary:
+                    # 采样处理
+                    event_count += 1
+                    if args.sample > 0 and event_count % args.sample != 0:
+                        return
+                    
+                    # 格式化输出
+                    timestamp = datetime.fromtimestamp(event.ts / 1000000000).strftime('%H:%M:%S.%f')
+                    cache_type = CACHE_TYPE_NAMES.get(event.type, f"未知({event.type})")
+                    op_name = CACHE_OP_NAMES.get(event.op, f"未知({event.op})")
+                    
+                    logging.info(f"[{timestamp}] PID: {event.pid} ({process_name}), "
+                          f"缓存类型: {cache_type}, 操作: {op_name}, 计数: {event.count}")
+            except Exception as e:
+                logging.error(f"处理缓存事件时出错: {str(e)}")
+        
+        # 注册事件回调
+        b["cache_events"].open_perf_buffer(event_callback)
+        
+        # 监控指定的时间
+        start_time = datetime.now()
+        logging.info(f"开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # 定义定期报告函数
+        next_report = time.time() + args.interval
+        
+        def periodic_report():
+            nonlocal next_report
+            if time.time() >= next_report:
+                elapsed = (datetime.now() - start_time).total_seconds()
+                logging.info(f"\n===== 中间报告 ({elapsed:.1f}秒) =====")
+                generate_cache_summary(accumulated_stats, process_stats, types_to_monitor, args)
+                next_report = time.time() + args.interval
+        
+        # 开始监控
+        try:
+            while (datetime.now() - start_time).total_seconds() < args.duration:
+                b.perf_buffer_poll(timeout=100)
+                periodic_report()
+        except KeyboardInterrupt:
+            logging.warning("监控被用户中断")
+        
+        end_time = datetime.now()
+        logging.info(f"结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        elapsed = (end_time - start_time).total_seconds()
+        logging.info(f"总监控时间: {elapsed:.2f}秒")
+        
+        # 最终报告
+        logging.info("\n===== 最终缓存统计报告 =====")
+        generate_cache_summary(accumulated_stats, process_stats, types_to_monitor, args)
+        
+    except Exception as e:
+        logging.exception(f"执行过程中发生错误: {str(e)}")
+        return 1
+    finally:
+        # 清理资源
+        if 'b' in locals():
+            b.cleanup()
     
-    # 清理资源
-    b.cleanup()
+    return 0
 
 if __name__ == "__main__":
-    main() 
+    exit_code = main()
+    sys.exit(exit_code) 

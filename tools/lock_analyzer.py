@@ -11,6 +11,12 @@ from bcc import BPF
 from datetime import datetime
 import ctypes as ct
 from collections import defaultdict
+import os
+import logging
+
+# 导入公共模块
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from src.ebpf_common import setup_logging, validate_args, setup_signal_handler
 
 # eBPF程序代码
 bpf_text = """
@@ -480,7 +486,7 @@ LOCK_TYPE_NAMES = {
     LOCK_TYPE_RWLOCK: "读写锁",
     LOCK_TYPE_SPINLOCK: "自旋锁",
     LOCK_TYPE_SEMAPHORE: "信号量",
-    LOCK_TYPE_FUTEX: "快速用户互斥锁"
+    LOCK_TYPE_FUTEX: "快速用户空间互斥锁"
 }
 
 # 锁操作名称
@@ -524,6 +530,8 @@ def parse_args():
         help="要监控的进程ID (0表示所有进程)")
     parser.add_argument("-d", "--duration", type=int, default=10,
         help="监控持续时间(秒)")
+    parser.add_argument("-i", "--interval", type=int, default=5,
+        help="报告间隔(秒)")
     parser.add_argument("-t", "--threshold", type=float, default=1.0,
         help="锁争用阈值(毫秒)，超过此值视为争用")
     parser.add_argument("-l", "--lock-type", type=str, default="all",
@@ -532,163 +540,57 @@ def parse_args():
         help="输出模式(all, contention, summary)")
     parser.add_argument("-c", "--count", type=int, default=10,
         help="显示争用最严重的前N个锁")
+    parser.add_argument("-v", "--verbose", action="store_true",
+        help="启用详细日志输出")
     return parser.parse_args()
 
-def addr2sym(b, addr, pid):
-    """将地址转换为符号名称"""
-    try:
-        sym = b.sym(addr, pid).decode('utf-8', 'replace')
-        return sym if sym else f"[未知 @ {addr:x}]"
-    except:
-        return f"[未知 @ {addr:x}]"
-
-def print_stack(b, stack_id, pid):
-    """打印堆栈跟踪"""
-    if stack_id < 0:
-        print("\t<未记录堆栈>")
-        return
+def validate_lock_args(args):
+    """验证锁分析器参数"""
+    if args.duration <= 0:
+        logging.error("监控时长必须大于0")
+        return False
+    if args.threshold < 0:
+        logging.error("锁争用阈值必须大于或等于0")
+        return False
+    if args.count <= 0:
+        logging.error("显示的锁数量必须大于0")
+        return False
+    if args.interval <= 0:
+        logging.error("报告间隔必须大于0")
+        return False
     
-    stack = list(b.get_table("stack_traces").walk(stack_id))
-    if not stack:
-        print("\t<空堆栈>")
-        return
-    
-    for addr in stack:
-        print(f"\t{addr2sym(b, addr, pid)}")
-
-def main():
-    args = parse_args()
-    
-    # 设置锁类型过滤器
+    # 验证锁类型过滤器
     lock_type_filter = args.lock_type.lower()
-    type_filter_map = {
-        "all": [LOCK_TYPE_MUTEX, LOCK_TYPE_RWLOCK, LOCK_TYPE_SPINLOCK, 
-                LOCK_TYPE_SEMAPHORE, LOCK_TYPE_FUTEX],
-        "mutex": [LOCK_TYPE_MUTEX],
-        "rwlock": [LOCK_TYPE_RWLOCK],
-        "spinlock": [LOCK_TYPE_SPINLOCK],
-        "semaphore": [LOCK_TYPE_SEMAPHORE],
-        "futex": [LOCK_TYPE_FUTEX]
-    }
-    types_to_monitor = type_filter_map.get(lock_type_filter, type_filter_map["all"])
+    valid_types = ["all", "mutex", "spinlock", "rwlock", "semaphore", "futex"]
+    if lock_type_filter not in valid_types:
+        logging.error(f"无效的锁类型过滤器: {lock_type_filter}, 有效值为: {', '.join(valid_types)}")
+        return False
     
-    threshold_ns = int(args.threshold * 1000000)  # 转换为纳秒
-    print(f"开始监控{'PID ' + str(args.pid) if args.pid else '所有进程'} 的锁争用情况...")
-    print(f"监控持续时间: {args.duration}秒")
-    print(f"锁争用阈值: {args.threshold}ms")
-    print(f"监控锁类型: {', '.join([LOCK_TYPE_NAMES[t] for t in types_to_monitor])}")
+    # 验证输出模式
+    output_mode = args.output.lower()
+    valid_modes = ["all", "contention", "summary"]
+    if output_mode not in valid_modes:
+        logging.error(f"无效的输出模式: {output_mode}, 有效值为: {', '.join(valid_modes)}")
+        return False
     
-    # 替换eBPF程序中的变量
-    bpf_program = bpf_text.replace('PID_FILTER', str(args.pid))
-    bpf_program = bpf_program.replace('THRESHOLD_NS', str(threshold_ns))
-    
-    # 加载eBPF程序
-    b = BPF(text=bpf_program)
-    
-    # 附加到锁相关函数
-    b.attach_kprobe(event="mutex_lock", fn_name="trace_mutex_lock")
-    b.attach_kretprobe(event="mutex_lock", fn_name="trace_mutex_lock_return")
-    b.attach_kprobe(event="mutex_unlock", fn_name="trace_mutex_unlock")
-    
-    b.attach_kprobe(event="_raw_spin_lock", fn_name="trace_spin_lock")
-    b.attach_kretprobe(event="_raw_spin_lock", fn_name="trace_spin_lock_return")
-    b.attach_kprobe(event="_raw_spin_unlock", fn_name="trace_spin_unlock")
-    
-    b.attach_kprobe(event="do_futex", fn_name="trace_futex_wait")
-    b.attach_kprobe(event="futex_wake", fn_name="trace_futex_wake")
-    
-    # 锁争用数据统计
-    lock_contention = defaultdict(lambda: {"count": 0, "total_wait": 0, "max_wait": 0})
-    
-    # 锁详细信息
-    lock_details = {}
-    
-    # 定义事件回调
-    def event_callback(cpu, data, size):
-        event = ct.cast(data, ct.POINTER(LockEvent)).contents
+    return True
+
+def generate_lock_contention_report(lock_contention, lock_details, args, final=False):
+    """生成锁争用报告"""
+    try:
+        report_type = "最终" if final else "中间"
+        logging.info(f"\n----- {report_type}锁争用报告 -----")
         
-        # 根据锁类型过滤
-        if event.type not in types_to_monitor:
+        if not lock_contention:
+            logging.info("未检测到锁争用。")
             return
         
-        # 获取基本信息
-        ts = event.ts
-        pid = event.pid
-        comm = event.comm.decode('utf-8', 'replace')
-        lock_addr = event.lock_addr
-        lock_type = event.type
-        op = event.op
-        duration_ns = event.duration_ns
-        duration_ms = duration_ns / 1000000
-        
-        # 保存锁详细信息
-        lock_key = (lock_addr, lock_type)
-        if lock_key not in lock_details:
-            lock_details[lock_key] = {
-                "address": lock_addr,
-                "type": lock_type,
-                "name": f"{LOCK_TYPE_NAMES[lock_type]}@{lock_addr:x}",
-                "processes": set()
-            }
-        lock_details[lock_key]["processes"].add((pid, comm))
-        
-        # 处理争用事件
-        if op == LOCK_OP_CONTENDED:
-            lock_contention[lock_key]["count"] += 1
-            lock_contention[lock_key]["total_wait"] += duration_ns
-            if duration_ns > lock_contention[lock_key]["max_wait"]:
-                lock_contention[lock_key]["max_wait"] = duration_ns
-        
-        # 根据输出模式决定是否输出
-        if args.output == "all" or (args.output == "contention" and op == LOCK_OP_CONTENDED):
-            timestamp = datetime.fromtimestamp(ts / 1000000000).strftime('%H:%M:%S.%f')
-            lock_type_name = LOCK_TYPE_NAMES.get(lock_type, f"未知({lock_type})")
-            op_name = LOCK_OP_NAMES.get(op, f"未知({op})")
-            
-            if op in [LOCK_OP_ACQUIRED, LOCK_OP_CONTENDED, LOCK_OP_RELEASE]:
-                print(f"[{timestamp}] PID: {pid} ({comm}), "
-                      f"锁类型: {lock_type_name}, 地址: 0x{lock_addr:x}, "
-                      f"操作: {op_name}, 持续时间: {duration_ms:.3f}ms")
-                
-                # 显示争用的堆栈
-                if op == LOCK_OP_CONTENDED:
-                    print(f"持有锁的堆栈:")
-                    print_stack(b, event.stack_id, pid)
-                    print("-" * 80)
-            else:
-                print(f"[{timestamp}] PID: {pid} ({comm}), "
-                      f"锁类型: {lock_type_name}, 地址: 0x{lock_addr:x}, "
-                      f"操作: {op_name}")
-    
-    # 注册事件回调
-    b["lock_events"].open_perf_buffer(event_callback)
-    
-    # 监控指定的时间
-    start_time = datetime.now()
-    print(f"开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    try:
-        while datetime.now() - start_time < datetime.timedelta(seconds=args.duration):
-            b.perf_buffer_poll(timeout=100)
-    except KeyboardInterrupt:
-        print("监控被用户中断")
-    
-    end_time = datetime.now()
-    print(f"结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"总监控时间: {(end_time - start_time).total_seconds():.2f}秒")
-    
-    # 输出锁争用摘要
-    print("\n----- 锁争用情况摘要 -----")
-    
-    if not lock_contention:
-        print("未检测到锁争用。")
-    else:
         # 按争用次数排序
         sorted_contention = sorted(lock_contention.items(), 
                                 key=lambda x: x[1]["count"], 
                                 reverse=True)
         
-        print("%-16s %-12s %-12s %-16s %-16s %-20s" % (
+        logging.info("%-16s %-12s %-12s %-16s %-16s %-20s" % (
             "锁地址", "类型", "争用次数", "总等待时间(ms)", "最大等待(ms)", "相关进程"))
         
         for i, ((lock_addr, lock_type), stats) in enumerate(sorted_contention[:args.count]):
@@ -706,7 +608,7 @@ def main():
             if len(processes) > 3:
                 process_str += f"... +{len(processes)-3}"
             
-            print("0x%-14x %-12s %-12d %-16.2f %-16.2f %-20s" % (
+            logging.info("0x%-14x %-12s %-12d %-16.2f %-16.2f %-20s" % (
                 lock_addr, 
                 lock_type_name, 
                 stats["count"],
@@ -717,11 +619,166 @@ def main():
         # 总计
         total_contentions = sum(stats["count"] for _, stats in lock_contention.items())
         total_wait_time = sum(stats["total_wait"] for _, stats in lock_contention.items()) / 1000000
-        print("-" * 92)
-        print(f"总计: {len(lock_contention)} 个锁发生争用, {total_contentions} 次争用, 总等待时间: {total_wait_time:.2f}ms")
+        logging.info("-" * 92)
+        logging.info(f"总计: {len(lock_contention)} 个锁发生争用, {total_contentions} 次争用, 总等待时间: {total_wait_time:.2f}ms")
+        
+        return sorted_contention
+    except Exception as e:
+        logging.error(f"生成锁争用报告时出错: {str(e)}")
+        return None
+
+def main():
+    args = parse_args()
     
-    # 清理资源
-    b.cleanup()
+    # 设置日志
+    setup_logging(args.verbose)
+    
+    # 参数校验
+    if not validate_lock_args(args):
+        return 1
+    
+    # 设置锁类型过滤器
+    lock_type_filter = args.lock_type.lower()
+    type_filter_map = {
+        "all": [LOCK_TYPE_MUTEX, LOCK_TYPE_RWLOCK, LOCK_TYPE_SPINLOCK, 
+                LOCK_TYPE_SEMAPHORE, LOCK_TYPE_FUTEX],
+        "mutex": [LOCK_TYPE_MUTEX],
+        "rwlock": [LOCK_TYPE_RWLOCK],
+        "spinlock": [LOCK_TYPE_SPINLOCK],
+        "semaphore": [LOCK_TYPE_SEMAPHORE],
+        "futex": [LOCK_TYPE_FUTEX]
+    }
+    types_to_monitor = type_filter_map.get(lock_type_filter, type_filter_map["all"])
+    
+    threshold_ns = int(args.threshold * 1000000)  # 转换为纳秒
+    logging.info(f"开始监控{'PID ' + str(args.pid) if args.pid else '所有进程'} 的锁争用情况...")
+    logging.info(f"监控持续时间: {args.duration}秒")
+    logging.info(f"报告间隔: {args.interval}秒")
+    logging.info(f"锁争用阈值: {args.threshold}ms")
+    logging.info(f"监控锁类型: {', '.join([LOCK_TYPE_NAMES[t] for t in types_to_monitor])}")
+    
+    try:
+        # 替换eBPF程序中的变量
+        bpf_program = bpf_text.replace('PID_FILTER', str(args.pid))
+        bpf_program = bpf_program.replace('THRESHOLD_NS', str(threshold_ns))
+        
+        # 加载eBPF程序
+        b = BPF(text=bpf_program)
+        
+        # 定义用于清理资源的函数
+        def cleanup():
+            if 'b' in locals():
+                b.cleanup()
+        
+        # 设置信号处理器
+        setup_signal_handler(cleanup)
+        
+        # 附加到锁相关函数
+        b.attach_kprobe(event="mutex_lock", fn_name="trace_mutex_lock")
+        b.attach_kretprobe(event="mutex_lock", fn_name="trace_mutex_lock_return")
+        b.attach_kprobe(event="mutex_unlock", fn_name="trace_mutex_unlock")
+        
+        b.attach_kprobe(event="_raw_spin_lock", fn_name="trace_spin_lock")
+        b.attach_kretprobe(event="_raw_spin_lock", fn_name="trace_spin_lock_return")
+        b.attach_kprobe(event="_raw_spin_unlock", fn_name="trace_spin_unlock")
+        
+        b.attach_kprobe(event="do_futex", fn_name="trace_futex_wait")
+        b.attach_kprobe(event="futex_wake", fn_name="trace_futex_wake")
+        
+        # 锁争用数据统计
+        lock_contention = defaultdict(lambda: {"count": 0, "total_wait": 0, "max_wait": 0})
+        
+        # 锁详细信息
+        lock_details = {}
+        
+        # 定义事件回调
+        def event_callback(cpu, data, size):
+            try:
+                event = ct.cast(data, ct.POINTER(LockEvent)).contents
+                
+                # 根据锁类型过滤
+                if event.type not in types_to_monitor:
+                    return
+                
+                # 获取基本信息
+                ts = event.ts
+                pid = event.pid
+                comm = event.comm.decode('utf-8', 'replace')
+                lock_addr = event.lock_addr
+                lock_type = event.type
+                op = event.op
+                duration_ns = event.duration_ns
+                duration_ms = duration_ns / 1000000
+                
+                # 保存锁详细信息
+                lock_key = (lock_addr, lock_type)
+                if lock_key not in lock_details:
+                    lock_details[lock_key] = {
+                        "address": lock_addr,
+                        "type": lock_type,
+                        "name": f"{LOCK_TYPE_NAMES[lock_type]}@{lock_addr:x}",
+                        "processes": set()
+                    }
+                lock_details[lock_key]["processes"].add((pid, comm))
+                
+                # 处理争用事件
+                if op == LOCK_OP_CONTENDED:
+                    lock_contention[lock_key]["count"] += 1
+                    lock_contention[lock_key]["total_wait"] += duration_ns
+                    if duration_ns > lock_contention[lock_key]["max_wait"]:
+                        lock_contention[lock_key]["max_wait"] = duration_ns
+                    
+                    # 根据输出模式决定是否输出详细事件
+                    if args.output == "all" or (args.output == "contention" and duration_ms >= args.threshold):
+                        lock_type_name = LOCK_TYPE_NAMES.get(lock_type, f"未知({lock_type})")
+                        logging.info(f"[{ts}] 进程 {comm} ({pid}) 在锁 {lock_type_name}@{lock_addr:x} 上等待: {duration_ms:.3f}ms")
+            except Exception as e:
+                logging.error(f"处理锁事件时出错: {str(e)}")
+        
+        # 注册事件回调
+        b["lock_events"].open_perf_buffer(event_callback)
+        
+        # 监控指定的时间
+        start_time = datetime.now()
+        logging.info(f"开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # 定义定期报告函数
+        next_report = time.time() + args.interval
+        
+        def periodic_report():
+            nonlocal next_report
+            if time.time() >= next_report:
+                elapsed = (datetime.now() - start_time).total_seconds()
+                logging.info(f"\n===== 中间报告 ({elapsed:.1f}秒) =====")
+                generate_lock_contention_report(lock_contention, lock_details, args, final=False)
+                next_report = time.time() + args.interval
+        
+        try:
+            while (datetime.now() - start_time).total_seconds() < args.duration:
+                b.perf_buffer_poll(timeout=100)
+                periodic_report()
+        except KeyboardInterrupt:
+            logging.warning("监控被用户中断")
+        
+        end_time = datetime.now()
+        logging.info(f"结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        elapsed = (end_time - start_time).total_seconds()
+        logging.info(f"总监控时间: {elapsed:.2f}秒")
+        
+        # 生成最终报告
+        logging.info("\n===== 最终锁争用分析报告 =====")
+        generate_lock_contention_report(lock_contention, lock_details, args, final=True)
+    
+    except Exception as e:
+        logging.exception(f"执行过程中发生错误: {str(e)}")
+        return 1
+    finally:
+        # 清理资源
+        if 'b' in locals():
+            b.cleanup()
+    
+    return 0
 
 if __name__ == "__main__":
-    main() 
+    exit_code = main()
+    sys.exit(exit_code) 

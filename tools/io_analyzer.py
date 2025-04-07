@@ -11,6 +11,13 @@ from bcc import BPF
 from datetime import datetime, timedelta
 import ctypes as ct
 from collections import defaultdict, namedtuple
+import os
+import logging
+import signal
+
+# 导入公共模块
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from src.ebpf_common import setup_logging, validate_args, setup_signal_handler, human_readable_size
 
 # eBPF程序代码
 bpf_text = """
@@ -523,310 +530,360 @@ class IOCompletion(ct.Structure):
         ("filename", ct.c_char * 64)
     ]
 
-def human_readable_size(size_bytes):
-    """将字节数转换为人类可读的大小表示"""
-    if size_bytes < 1024:
-        return f"{size_bytes} B"
-    elif size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.2f} KB"
-    elif size_bytes < 1024 * 1024 * 1024:
-        return f"{size_bytes / (1024 * 1024):.2f} MB"
-    else:
-        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+# 文件和进程统计结构
+FileStats = namedtuple('FileStats', [
+    'filename', 'read_count', 'write_count', 'sync_count',
+    'read_bytes', 'write_bytes', 'read_latency', 'write_latency', 'sync_latency'
+])
+
+ProcStats = namedtuple('ProcStats', [
+    'comm', 'pid', 'read_count', 'write_count', 'sync_count',
+    'read_bytes', 'write_bytes', 'read_latency', 'write_latency', 'sync_latency'
+])
+
+# 创建新实例的工厂函数
+def create_file_stats(filename):
+    return FileStats(
+        filename=filename,
+        read_count=0, write_count=0, sync_count=0,
+        read_bytes=0, write_bytes=0,
+        read_latency=0, write_latency=0, sync_latency=0
+    )
+
+def create_proc_stats(comm, pid):
+    return ProcStats(
+        comm=comm, pid=pid,
+        read_count=0, write_count=0, sync_count=0,
+        read_bytes=0, write_bytes=0,
+        read_latency=0, write_latency=0, sync_latency=0
+    )
 
 def parse_args():
-    """解析命令行参数"""
+    """解析命令行参数并校验"""
     parser = argparse.ArgumentParser(
-        description="I/O分析工具 - 监控文件系统和磁盘I/O性能")
+        description="I/O分析器 - 监控文件系统和磁盘I/O性能")
     parser.add_argument("pid", type=int, nargs="?", default=0,
         help="要监控的进程ID (0表示所有进程)")
-    parser.add_argument("-d", "--duration", type=int, default=10,
+    parser.add_argument("-d", "--duration", type=int, default=60,
         help="监控持续时间(秒)")
+    parser.add_argument("-i", "--interval", type=int, default=5,
+        help="报告间隔(秒)")
     parser.add_argument("-t", "--top", type=int, default=10,
-        help="显示最活跃的前N个进程/文件")
+        help="显示I/O量最大的前N个文件和进程")
+    parser.add_argument("-f", "--filter", type=str, default="",
+        help="文件名过滤器(只跟踪包含指定字符串的文件)")
+    parser.add_argument("-p", "--processes", action="store_true",
+        help="显示进程I/O统计")
+    parser.add_argument("-F", "--files", action="store_true",
+        help="显示文件I/O统计")
     parser.add_argument("-l", "--latency", action="store_true",
-        help="显示I/O延迟分布")
-    parser.add_argument("-f", "--files", action="store_true",
-        help="按文件名统计I/O")
-    parser.add_argument("-p", "--processes", action="store_true", 
-        help="按进程统计I/O")
-    parser.add_argument("-a", "--all-events", action="store_true",
+        help="显示延迟分布")
+    parser.add_argument("-a", "--all", action="store_true",
         help="显示所有I/O事件")
-    parser.add_argument("-r", "--read", action="store_true",
-        help="仅跟踪读操作")
-    parser.add_argument("-w", "--write", action="store_true",
-        help="仅跟踪写操作")
-    parser.add_argument("-s", "--sync", action="store_true",
-        help="仅跟踪同步操作")
+    parser.add_argument("-v", "--verbose", action="store_true",
+        help="启用详细日志输出")
     return parser.parse_args()
 
-def compute_stats(args, b):
-    """计算I/O统计信息"""
-    stats = {}
-    
-    # 进程I/O统计
-    if args.processes:
-        stats["processes"] = []
-        
-        # 读取统计
-        read_counts = {}
-        read_bytes = {}
-        for k, v in b["proc_read_count"].items():
-            read_counts[k.value] = v.value
-        for k, v in b["proc_read_bytes"].items():
-            read_bytes[k.value] = v.value
-            
-        # 写入统计
-        write_counts = {}
-        write_bytes = {}
-        for k, v in b["proc_write_count"].items():
-            write_counts[k.value] = v.value
-        for k, v in b["proc_write_bytes"].items():
-            write_bytes[k.value] = v.value
-            
-        # 合并结果
-        all_pids = set(list(read_counts.keys()) + list(write_counts.keys()))
-        for pid in all_pids:
-            r_count = read_counts.get(pid, 0)
-            r_bytes = read_bytes.get(pid, 0)
-            w_count = write_counts.get(pid, 0)
-            w_bytes = write_bytes.get(pid, 0)
-            stats["processes"].append({
-                "pid": pid,
-                "read_count": r_count,
-                "read_bytes": r_bytes,
-                "write_count": w_count,
-                "write_bytes": w_bytes,
-                "total_count": r_count + w_count,
-                "total_bytes": r_bytes + w_bytes
-            })
-            
-        # 按总I/O大小排序
-        stats["processes"].sort(key=lambda x: x["total_bytes"], reverse=True)
-    
-    # 文件I/O统计
-    if args.files:
-        stats["files"] = []
-        
-        # 读取统计
-        read_counts = {}
-        read_bytes = {}
-        for k, v in b["file_read_count"].items():
-            filename = k.value.decode('utf-8', 'replace')
-            read_counts[filename] = v.value
-        for k, v in b["file_read_bytes"].items():
-            filename = k.value.decode('utf-8', 'replace')
-            read_bytes[filename] = v.value
-            
-        # 写入统计
-        write_counts = {}
-        write_bytes = {}
-        for k, v in b["file_write_count"].items():
-            filename = k.value.decode('utf-8', 'replace')
-            write_counts[filename] = v.value
-        for k, v in b["file_write_bytes"].items():
-            filename = k.value.decode('utf-8', 'replace')
-            write_bytes[filename] = v.value
-            
-        # 合并结果
-        all_files = set(list(read_counts.keys()) + list(write_counts.keys()))
-        for filename in all_files:
-            if not filename:  # 跳过空文件名
-                continue
-                
-            r_count = read_counts.get(filename, 0)
-            r_bytes = read_bytes.get(filename, 0)
-            w_count = write_counts.get(filename, 0)
-            w_bytes = write_bytes.get(filename, 0)
-            stats["files"].append({
-                "filename": filename,
-                "read_count": r_count,
-                "read_bytes": r_bytes,
-                "write_count": w_count,
-                "write_bytes": w_bytes,
-                "total_count": r_count + w_count,
-                "total_bytes": r_bytes + w_bytes
-            })
-            
-        # 按总I/O大小排序
-        stats["files"].sort(key=lambda x: x["total_bytes"], reverse=True)
-    
-    # 延迟分布
-    if args.latency:
-        stats["latency"] = {
-            "read": b["read_lat_us"],
-            "write": b["write_lat_us"],
-            "sync": b["sync_lat_us"]
-        }
-        
-    return stats
+def validate_io_args(args):
+    """验证I/O分析器参数"""
+    if args.duration <= 0:
+        logging.error("监控时长必须大于0")
+        return False
+    if args.interval <= 0:
+        logging.error("报告间隔必须大于0")
+        return False
+    if args.top <= 0:
+        logging.error("显示数量必须大于0")
+        return False
+    return True
 
-def print_io_event(event):
-    """打印单个I/O事件"""
-    ts = datetime.fromtimestamp(event.ts / 1000000000).strftime('%H:%M:%S.%f')
-    type_name = IO_TYPE_NAMES.get(event.type, f"未知({event.type})")
-    comm = event.comm.decode('utf-8', 'replace')
-    filename = event.filename.decode('utf-8', 'replace')
-    
-    if event.type in [IO_READ, IO_WRITE]:
-        size = human_readable_size(event.bytes)
-        latency = event.delta_us / 1000  # 转换为毫秒
-        print(f"[{ts}] 进程: {comm}({event.pid}), 操作: {type_name}, "
-              f"文件: {filename}, 大小: {size}, 延迟: {latency:.3f}毫秒")
-    elif event.type in [IO_FSYNC, IO_SYNC]:
-        latency = event.delta_us / 1000  # 转换为毫秒
-        print(f"[{ts}] 进程: {comm}({event.pid}), 操作: {type_name}, "
-              f"文件: {filename}, 延迟: {latency:.3f}毫秒")
-    else:
-        print(f"[{ts}] 进程: {comm}({event.pid}), 操作: {type_name}, "
-              f"文件: {filename}")
+def log_io_event(event):
+    """记录单个I/O事件"""
+    try:
+        ts = datetime.fromtimestamp(event.ts / 1000000000).strftime('%H:%M:%S.%f')
+        type_name = IO_TYPE_NAMES.get(event.type, f"未知({event.type})")
+        comm = event.comm.decode('utf-8', 'replace')
+        filename = event.filename.decode('utf-8', 'replace')
+        
+        if event.type in [IO_READ, IO_WRITE]:
+            size = human_readable_size(event.bytes)
+            latency = event.delta_us / 1000  # 转换为毫秒
+            logging.info(f"[{ts}] 进程: {comm}({event.pid}), 操作: {type_name}, "
+                  f"文件: {filename}, 大小: {size}, 延迟: {latency:.3f}毫秒")
+        elif event.type in [IO_FSYNC, IO_SYNC]:
+            latency = event.delta_us / 1000  # 转换为毫秒
+            logging.info(f"[{ts}] 进程: {comm}({event.pid}), 操作: {type_name}, "
+                  f"文件: {filename}, 延迟: {latency:.3f}毫秒")
+        else:
+            logging.info(f"[{ts}] 进程: {comm}({event.pid}), 操作: {type_name}, "
+                  f"文件: {filename}")
+    except Exception as e:
+        logging.error(f"记录I/O事件时出错: {str(e)}")
 
-def print_latency_distribution(dist, dist_type):
-    """打印延迟分布"""
-    print(f"\n{dist_type}操作延迟分布:")
-    print("-" * 60)
-    dist.print_log2_hist("延迟(微秒)")
+def log_latency_distribution(dist, dist_type):
+    """记录延迟分布"""
+    try:
+        logging.info(f"\n{dist_type}操作延迟分布:")
+        logging.info("-" * 60)
+        
+        # 由于BPF直方图的print_log2_hist方法输出到标准输出，
+        # 我们需要捕获并通过logging输出
+        import io
+        from contextlib import redirect_stdout
+        
+        f = io.StringIO()
+        with redirect_stdout(f):
+            dist.print_log2_hist("延迟(微秒)")
+        
+        for line in f.getvalue().split('\n'):
+            if line.strip():
+                logging.info(line)
+    except Exception as e:
+        logging.error(f"记录延迟分布时出错: {str(e)}")
+
+def generate_io_report(b, file_stats, proc_stats, args, final=False):
+    """生成I/O统计报告"""
+    try:
+        report_type = "最终" if final else "中间"
+        logging.info(f"\n===== {report_type}I/O性能报告 =====")
+        
+        # 进程I/O统计
+        if args.processes:
+            logging.info("\n----- 按进程的I/O统计 -----")
+            
+            # 按总I/O量排序
+            sorted_procs = sorted(
+                proc_stats.values(), 
+                key=lambda p: p.read_bytes + p.write_bytes, 
+                reverse=True
+            )[:args.top]
+            
+            logging.info("%-20s %-7s %-12s %-12s %-12s %-12s %-12s" % (
+                "进程", "PID", "读取次数", "写入次数", "读取量", "写入量", "总I/O量"))
+            
+            for proc in sorted_procs:
+                total_io = proc.read_bytes + proc.write_bytes
+                logging.info("%-20s %-7d %-12d %-12d %-12s %-12s %-12s" % (
+                    proc.comm, proc.pid, 
+                    proc.read_count, proc.write_count,
+                    human_readable_size(proc.read_bytes),
+                    human_readable_size(proc.write_bytes),
+                    human_readable_size(total_io)
+                ))
+        
+        # 文件I/O统计
+        if args.files:
+            logging.info("\n----- 按文件的I/O统计 -----")
+            
+            # 按总I/O量排序
+            sorted_files = sorted(
+                file_stats.values(), 
+                key=lambda f: f.read_bytes + f.write_bytes, 
+                reverse=True
+            )[:args.top]
+            
+            logging.info("%-30s %-12s %-12s %-12s %-12s %-12s" % (
+                "文件", "读取次数", "写入次数", "读取量", "写入量", "总I/O量"))
+            
+            for file in sorted_files:
+                total_io = file.read_bytes + file.write_bytes
+                # 文件名可能很长，做适当截断
+                filename = file.filename if len(file.filename) <= 27 else "..." + file.filename[-24:]
+                logging.info("%-30s %-12d %-12d %-12s %-12s %-12s" % (
+                    filename,
+                    file.read_count, file.write_count,
+                    human_readable_size(file.read_bytes),
+                    human_readable_size(file.write_bytes),
+                    human_readable_size(total_io)
+                ))
+        
+        # 延迟分布
+        if args.latency and final:
+            log_latency_distribution(b["read_lat_us"], "读取")
+            log_latency_distribution(b["write_lat_us"], "写入")
+            log_latency_distribution(b["sync_lat_us"], "同步")
+        
+        return True
+    except Exception as e:
+        logging.error(f"生成I/O报告时出错: {str(e)}")
+        return False
 
 def main():
+    """主函数，处理程序启动、运行和清理"""
     args = parse_args()
     
-    # 确定要跟踪的操作
-    if not (args.read or args.write or args.sync):
-        # 默认跟踪所有操作
-        args.read = True
-        args.write = True
-        args.sync = True
+    # 设置日志
+    setup_logging(args.verbose)
     
-    # 创建eBPF程序
-    bpf_program = bpf_text.replace('PID_FILTER', str(args.pid))
-    b = BPF(text=bpf_program)
+    # 参数校验
+    if not validate_io_args(args):
+        return 1
     
-    # 附加到内核函数
-    if args.read:
+    # 确保至少启用一种报告类型
+    if not (args.processes or args.files or args.latency or args.all):
+        args.processes = True
+        args.files = True
+    
+    logging.info(f"开始监控{'PID ' + str(args.pid) if args.pid else '所有进程'} 的I/O性能...")
+    logging.info(f"监控持续时间: {args.duration}秒")
+    logging.info(f"报告间隔: {args.interval}秒")
+    if args.filter:
+        logging.info(f"文件名过滤器: {args.filter}")
+    
+    try:
+        # eBPF程序
+        bpf_program = bpf_text.replace('PID_FILTER', str(args.pid))
+        # 文件名过滤器
+        if args.filter:
+            file_filter = f"""
+            if (memchr(req.filename, '{args.filter}', sizeof(req.filename)) == NULL)
+                return 0;
+            """
+            bpf_program = bpf_program.replace('FILE_FILTER', file_filter)
+        else:
+            bpf_program = bpf_program.replace('FILE_FILTER', '')
+        
+        # 加载eBPF程序
+        b = BPF(text=bpf_program)
+        
+        # 定义用于清理资源的函数
+        def cleanup():
+            if 'b' in locals():
+                b.cleanup()
+        
+        # 设置信号处理器
+        setup_signal_handler(cleanup)
+        
+        # 附加到I/O相关函数
         b.attach_kprobe(event="vfs_read", fn_name="trace_read_entry")
         b.attach_kretprobe(event="vfs_read", fn_name="trace_read_return")
-    
-    if args.write:
         b.attach_kprobe(event="vfs_write", fn_name="trace_write_entry")
         b.attach_kretprobe(event="vfs_write", fn_name="trace_write_return")
-    
-    if args.sync:
         b.attach_kprobe(event="vfs_fsync", fn_name="trace_fsync_entry")
         b.attach_kretprobe(event="vfs_fsync", fn_name="trace_fsync_return")
         
-        # 也可以附加到open函数来跟踪文件打开操作
-        b.attach_kprobe(event="do_sys_open", fn_name="trace_open")
-    
-    # I/O事件计数
-    event_count = 0
-    
-    # 定义事件回调函数
-    def handle_io_event(cpu, data, size):
-        nonlocal event_count
-        event = ct.cast(data, ct.POINTER(IOCompletion)).contents
+        # 如果内核支持，附加到更多函数
+        try:
+            if BPF.get_kprobe_functions(b'blk_start_request'):
+                b.attach_kprobe(event="blk_start_request", fn_name="trace_req_start")
+            b.attach_kprobe(event="blk_mq_start_request", fn_name="trace_req_start")
+            b.attach_kprobe(event="blk_account_io_done", fn_name="trace_req_completion")
+        except Exception as e:
+            logging.warning(f"附加到块设备I/O函数时出错: {str(e)}")
         
-        if args.all_events:
-            print_io_event(event)
-            
-        event_count += 1
-    
-    # 注册回调
-    b["io_events"].open_perf_buffer(handle_io_event)
-    
-    # 监控指定时间
-    start_time = datetime.now()
-    print(f"开始监控{'PID ' + str(args.pid) if args.pid else '所有进程'} 的I/O活动...")
-    print(f"持续时间: {args.duration}秒")
-    print(f"监控的操作: {'读取 ' if args.read else ''}{'写入 ' if args.write else ''}{'同步 ' if args.sync else ''}")
-    print(f"开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # 周期性更新
-    update_interval = min(args.duration, 1)  # 最多1秒更新一次
-    seconds_passed = 0
-    
-    try:
-        while seconds_passed < args.duration:
-            b.perf_buffer_poll(timeout=1000)
-            
-            now = datetime.now()
-            elapsed = (now - start_time).total_seconds()
-            if elapsed >= seconds_passed + update_interval:
-                seconds_passed = int(elapsed)
-                
-                # 如果显示所有事件，则不打印进度
-                if not args.all_events:
-                    print(f"已监控 {seconds_passed} 秒... 收集了 {event_count} 个I/O事件")
-                    
-    except KeyboardInterrupt:
-        print("监控被用户中断")
-    
-    end_time = datetime.now()
-    print(f"\n结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"总监控时间: {(end_time - start_time).total_seconds():.2f}秒")
-    print(f"总计捕获了 {event_count} 个I/O事件")
-    
-    # 计算统计信息
-    stats = compute_stats(args, b)
-    
-    # 打印进程I/O统计
-    if args.processes and "processes" in stats:
-        print("\n----- 进程I/O统计 (按总I/O排序) -----")
-        print("%-6s %-16s %-10s %-10s %-10s %-10s %-10s" % (
-            "PID", "进程名", "读取次数", "读取大小", "写入次数", "写入大小", "总I/O大小"))
+        # 初始化统计信息
+        file_stats = {}
+        proc_stats = {}
         
-        # 获取进程名称
-        processes = stats["processes"][:args.top]
-        for proc in processes:
-            pid = proc["pid"]
+        # I/O事件处理函数
+        def handle_io_event(cpu, data, size):
             try:
-                with open(f"/proc/{pid}/comm", "r") as f:
-                    comm = f.read().strip()
-            except:
-                comm = f"[未知]"
+                event = ct.cast(data, ct.POINTER(IOCompletion)).contents
+                if args.all:
+                    log_io_event(event)
+                    
+                # 按文件类型维护统计信息
+                filename = event.filename.decode('utf-8', 'replace')
+                if filename not in file_stats:
+                    file_stats[filename] = create_file_stats(filename)
                 
-            print("%-6d %-16s %-10d %-10s %-10d %-10s %-10s" % (
-                pid,
-                comm,
-                proc["read_count"],
-                human_readable_size(proc["read_bytes"]),
-                proc["write_count"],
-                human_readable_size(proc["write_bytes"]),
-                human_readable_size(proc["total_bytes"])
-            ))
-    
-    # 打印文件I/O统计
-    if args.files and "files" in stats:
-        print("\n----- 文件I/O统计 (按总I/O排序) -----")
-        print("%-30s %-10s %-10s %-10s %-10s %-10s" % (
-            "文件名", "读取次数", "读取大小", "写入次数", "写入大小", "总I/O大小"))
+                file_stat = file_stats[filename]
+                    
+                # 更新文件统计
+                if event.type == IO_READ:  # 读
+                    file_stats[filename] = file_stat._replace(
+                        read_count=file_stat.read_count + 1,
+                        read_bytes=file_stat.read_bytes + event.bytes,
+                        read_latency=file_stat.read_latency + event.delta_us
+                    )
+                elif event.type == IO_WRITE:  # 写
+                    file_stats[filename] = file_stat._replace(
+                        write_count=file_stat.write_count + 1,
+                        write_bytes=file_stat.write_bytes + event.bytes,
+                        write_latency=file_stat.write_latency + event.delta_us
+                    )
+                elif event.type == IO_FSYNC:  # 同步
+                    file_stats[filename] = file_stat._replace(
+                        sync_count=file_stat.sync_count + 1,
+                        sync_latency=file_stat.sync_latency + event.delta_us
+                    )
+                
+                # 按进程维护统计信息
+                pid = event.pid
+                comm = event.comm.decode('utf-8', 'replace')
+                proc_key = f"{comm}:{pid}"
+                if proc_key not in proc_stats:
+                    proc_stats[proc_key] = create_proc_stats(comm, pid)
+                
+                proc_stat = proc_stats[proc_key]
+                    
+                # 更新进程统计
+                if event.type == IO_READ:  # 读
+                    proc_stats[proc_key] = proc_stat._replace(
+                        read_count=proc_stat.read_count + 1,
+                        read_bytes=proc_stat.read_bytes + event.bytes,
+                        read_latency=proc_stat.read_latency + event.delta_us
+                    )
+                elif event.type == IO_WRITE:  # 写
+                    proc_stats[proc_key] = proc_stat._replace(
+                        write_count=proc_stat.write_count + 1,
+                        write_bytes=proc_stat.write_bytes + event.bytes,
+                        write_latency=proc_stat.write_latency + event.delta_us
+                    )
+                elif event.type == IO_FSYNC:  # 同步
+                    proc_stats[proc_key] = proc_stat._replace(
+                        sync_count=proc_stat.sync_count + 1,
+                        sync_latency=proc_stat.sync_latency + event.delta_us
+                    )
+            except Exception as e:
+                logging.error(f"处理I/O事件时出错: {str(e)}")
         
-        files = stats["files"][:args.top]
-        for file in files:
-            filename = file["filename"]
-            if len(filename) > 30:
-                # 截断长文件名
-                filename = "..." + filename[-27:]
-                
-            print("%-30s %-10d %-10s %-10d %-10s %-10s" % (
-                filename,
-                file["read_count"],
-                human_readable_size(file["read_bytes"]),
-                file["write_count"],
-                human_readable_size(file["write_bytes"]),
-                human_readable_size(file["total_bytes"])
-            ))
+        # 注册回调
+        b["io_events"].open_perf_buffer(handle_io_event)
+        
+        # 输出表头
+        if args.all:
+            logging.info(f"{'时间戳':<12} {'进程':<20} {'操作':<8} {'字节数':<10} {'延迟(微秒)':<10} {'文件名':<30}")
+            logging.info("-" * 90)
+        
+        # 开始监控
+        start_time = time.time()
+        logging.info(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # 定期报告函数
+        next_report = start_time + args.interval
+        
+        def periodic_report():
+            nonlocal next_report
+            if time.time() >= next_report:
+                elapsed = time.time() - start_time
+                logging.info(f"\n===== 中间报告 ({elapsed:.1f}秒) =====")
+                generate_io_report(b, file_stats, proc_stats, args, final=False)
+                next_report = time.time() + args.interval
+        
+        # 主循环
+        try:
+            while time.time() - start_time < args.duration:
+                b.perf_buffer_poll(timeout=100)
+                periodic_report()
+        except KeyboardInterrupt:
+            logging.warning("监控被用户中断")
+            
+        # 生成最终报告
+        logging.info("\n===== 最终I/O性能报告 =====")
+        generate_io_report(b, file_stats, proc_stats, args, final=True)
+            
+    except Exception as e:
+        logging.exception(f"程序执行过程中发生错误: {str(e)}")
+        return 1
+    finally:
+        # 清理资源
+        if 'b' in locals():
+            b.cleanup()
+        logging.info("监控完成.")
     
-    # 打印延迟分布
-    if args.latency and "latency" in stats:
-        if args.read:
-            print_latency_distribution(stats["latency"]["read"], "读取")
-        if args.write:
-            print_latency_distribution(stats["latency"]["write"], "写入")
-        if args.sync:
-            print_latency_distribution(stats["latency"]["sync"], "同步")
-    
-    # 清理资源
-    b.cleanup()
+    return 0
 
 if __name__ == "__main__":
-    main() 
+    exit_code = main()
+    sys.exit(exit_code) 
